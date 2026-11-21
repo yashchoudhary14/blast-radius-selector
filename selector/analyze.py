@@ -19,6 +19,8 @@ from .collect import BASE, MAPS
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
+from .source_equivalence import (compile_source, docstring_only, line_insertion, relocated_code,
+                                 same_code, same_directives, signature_metadata)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -415,8 +417,81 @@ class Analyzer:
         return marshal.loads(cache.read_bytes()) if cache.is_file() else {}
 
     @lru_cache(maxsize=32)
+    def old_compiled(self, path):
+        return compile_source((self.base / path).read_bytes(), path)
+
+    @lru_cache(maxsize=32)
     def old_code(self, path):
-        return functions(compile((self.base / path).read_bytes(), path, "exec", dont_inherit=True))
+        return functions(self.old_compiled(path)[0])
+
+    @lru_cache(maxsize=1)
+    def doc_observers(self):
+        mask = 0
+        # The pinned "*module" sites are lazy-export tables (which never
+        # forward __doc__) and serde's immediately invoked attribute (where
+        # both doc values are non-callable strings).
+        for name in ("getdoc", "getsource", "getsourcelines", "DocTestSuite", "doctest",
+                     "pydoc", "help", "*", "*sqlvalue", "co_positions", "__code__"):
+            mask |= self.state_refs.mask(name)
+        for path, lines in self.state_refs.refs.get("__doc__", {}).items():
+            # This pinned hook reads only the doc of an Expr subclass under
+            # construction. Plain top-level classes and modules can't be cls.
+            hook = None
+            if path == "sqlglot/expressions/core.py":
+                hook = _get_func_node(self.old_tree_and_lines(path)[0], "Expr.__init_subclass__")
+            runtime = self.line_hits(path)
+            imports = self.indirect_hits.get(path, {})
+            for line in lines:
+                if hook is None or not hook.lineno <= line <= hook.end_lineno:
+                    mask |= runtime.get(line, 0) | imports.get(line, 0)
+        return mask
+
+    @lru_cache(maxsize=1)
+    def signature_observers(self):
+        mask = 0
+        for name in ("__annotations__", "__defaults__", "__kwdefaults__", "get_type_hints",
+                     "get_annotations", "signature", "getargspec", "getfullargspec", "getsource",
+                     "getsourcelines", "co_positions", "__code__", "pydoc", "help", "*", "*sqlvalue",
+                     "exec", "eval", "locals", "f_locals", "currentframe", "_getframe", "getouterframes"):
+            mask |= self.state_refs.mask(name)
+        return mask
+
+    @lru_cache(maxsize=1)
+    def location_observers(self):
+        mask = 0
+        for name in ("getsource", "getsourcelines", "linecache", "__code__", "co_positions", "co_lines",
+                     "co_firstlineno", "__firstlineno__", "co_names", "co_lnotab", "co_linetable",
+                     "lineno", "f_lineno", "tb_lineno", "records", "traceback", "__traceback__", "exc_info",
+                     "currentframe", "_getframe", "getouterframes", "settrace", "gettrace", "setprofile",
+                     "catch_warnings", "filterwarnings", "assertWarns", "assertWarnsRegex", "warns", "*"):
+            mask |= self.state_refs.mask(name)
+        return mask
+
+    def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits):
+        old = (self.base / path).read_bytes()
+        insertion = line_insertion(old, new)
+        if not (scope_edits or headers or insertion):
+            return None
+        before, diagnostics = self.old_compiled(path)
+        if diagnostics:
+            return None
+        if insertion and relocated_code(before, compiled, insertion) and same_directives(old, new, insertion):
+            return self.location_observers()
+        if not (scope_edits or headers):
+            return None
+        if same_code(before, compiled) and same_directives(old, new):
+            return 0  # Independent source readers were already selected.
+        old_tree, _ = self.old_tree_and_lines(path)
+        if docstring_only(old, new, old_tree, new_tree, before, compiled):
+            return self.doc_observers()
+        if len(headers) == 1:
+            q = headers[0]
+            if signature_metadata(old, new, old_tree, new_tree, q, before, compiled):
+                body = functions(compiled).get(q)
+                original = self.old_code(path).get(q)
+                if body and original and same_code(original, body) and same_directives(old, new):
+                    return self.signature_observers()
+        return None
 
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
@@ -686,15 +761,30 @@ class Analyzer:
             if new is None:
                 raise SyntaxError("deleted module")
             # ast.parse alone accepts constructs such as return outside a function.
-            compiled = compile(new, path, "exec", dont_inherit=True)
+            compiled, diagnostics = compile_source(new, path)
             tree = ast.parse(new, path)
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
             out.broken = True
             return
+        if diagnostics and diagnostics != self.old_compiled(path)[1]:
+            # The grader can promote a compile-time warning to an import error.
+            out.broad |= coverage | self.importers[path] | self.file_tests[path]
+            out.broken = True
+            return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
+        if single_edit and not diagnostics and path.startswith("sqlglot/"):
+            headers = [q for q, fn in new_funcs.items() if old_funcs.get(q, (None, None))[1] != fn[1]]
+            scope_edits = old_scopes != new_scopes
+            if scope_edits or headers or any(old_funcs[q][2] != new_funcs[q][2] for q in old_funcs.keys() & new_funcs.keys()):
+                refined = self._source_equivalence(path, new, new_tree_for_stmts, compiled, headers, scope_edits)
+                if refined is not None:
+                    out.direct |= refined
+                    out.query_spans = None
+                    out.dialect_subset_safe = False
+                    return
         # Module statements, top-level definition order, and class/function
         # headers execute at import. Ignore changes confined to their bodies.
         if out.dialect_subset_safe:
