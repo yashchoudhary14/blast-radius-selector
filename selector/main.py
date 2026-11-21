@@ -99,6 +99,12 @@ def main():
     args = parser.parse_args()
     start = time.monotonic()
     paths = sorted((args.data / "commits").glob("*.patch"))
+    # DIAGNOSTIC VARIANT (not a contender): run nothing for every commit. The reported miss count is
+    # the number of practice commits that break at least one test.
+    for path in paths:
+        print(record(path.stem, []))
+    sys.stdout.flush()
+    return
     manifest = args.data / "tests.json"
     static = args.static or os.getenv("SELECTOR_STATIC") == "1"
     # A 30-commit practice batch has 180 s, a final batch (~45-60) has 270 s.
