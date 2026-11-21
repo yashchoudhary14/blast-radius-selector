@@ -1003,7 +1003,19 @@ class Analyzer:
                 if path.startswith("sqlglot/typing/") and new is not None:
                     mask = self.typing_readers(path, new, new_classes)
                     if mask is not None:
-                        if concrete_edits and concrete(path, "typing"):
+                        typing_safe = all(
+                            p in isolated_tests
+                            or concrete_edit(p, d)
+                            or (
+                                p == "sqlglot/typing/__init__.py"
+                                and d is not None
+                                and (self.base / p).is_file()
+                                and edits.modes.get(p, (self.base / p).stat().st_mode & 0o777)
+                                == ((self.base / p).stat().st_mode & 0o777)
+                            )
+                            for p, d in edits.items()
+                        )
+                        if typing_safe and (concrete(path, "typing") or path == "sqlglot/typing/__init__.py"):
                             original = (self.base / path).read_bytes()
                             if same_directive_lines(original, new):
                                 names, _ = changed_metadata(ast.parse(original), ast.parse(new))
