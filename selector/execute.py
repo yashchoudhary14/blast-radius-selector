@@ -3,6 +3,7 @@
 import os
 import time
 from collections import defaultdict
+from functools import lru_cache
 
 from runner import GENERATOR_MEMORY, cpu_time
 from .analyze import numbers
@@ -10,7 +11,7 @@ from .dialect_cases import DialectCases
 from .patch_proof import PatchProof
 from .proxies import can_prove_pass
 from .query_cases import MAX_NODES, TPCDS
-from .workers import schedule
+from .workers import WORKER_MS, schedule
 
 
 # Shared fork and unittest fixture costs for a batch of warm test methods.
@@ -34,7 +35,8 @@ class Execution:
         self.ids = {t["number"]: t["id"] for t in tests}
         self.num = {node: n for n, node in self.ids.items()}
         self.memory = self.num.get(GENERATOR_MEMORY)
-        self.catalog_cost = self.cost(millis)
+        self.catalog_workers, catalog_ms = schedule(millis, millis)
+        self.catalog_cost = catalog_ms / 1000
         self.heavy_cases = {self.num[test] for test in (MAX_NODES, TPCDS) if test in self.num}
         self.dialects = DialectCases(analyzer.maps)
         self.files = {t["number"]: t["file"] for t in tests}
@@ -113,9 +115,22 @@ class Execution:
         def run_cost(batch):
             return self.run_cost(batch) - sum(discounts[n] for n in discounts if n in batch)
 
-        def emitted_cost(selection):
+        uncandidated = frozenset(n for n in self.millis if not candidates.mask & (1 << n))
+
+        @lru_cache(maxsize=64)
+        def emitted_cost_cached(selection):
             cost = self.cost(selection)
-            return cost if candidates.structural else min(cost, self.catalog_cost)
+            if candidates.structural or cost < self.catalog_cost:
+                return cost
+            # The final lane reuses the catalog's worker assignment at the
+            # price cap, but it still honors completed and zero-case probes.
+            emitted = selection | uncandidated
+            loads = [sum(self.millis[n] for n in worker if n in emitted) for worker in self.catalog_workers
+                     if any(n in emitted for n in worker)]
+            return (max(loads) + WORKER_MS * len(loads)) / 1000
+
+        def emitted_cost(selection):
+            return emitted_cost_cached(frozenset(selection))
 
         subset = self.dialects.subset(candidates) if self.memory is not None else None
         if subset is not None:
@@ -239,7 +254,15 @@ class Execution:
                 if estimate > budget:
                     continue
                 gain = static - roi_cost(conservative(selected - batch))
-                if failed or key & discounts.keys():
+                if len(key) == 2 and key <= self.heavy_cases and key <= discounts.keys():
+                    first = min(batch, key=rank)
+                    first_cost = run_cost({first})
+                    first_gain = static - roi_cost(conservative(selected - {first}))
+                    # A filtered batch stops on its first failure. If only its
+                    # first method passes, that method still leaves the schedule.
+                    net = (pass_chance * ((1 - pass_chance) * first_gain + pass_chance * gain)
+                           - first_cost - pass_chance * (estimate - first_cost))
+                elif failed or key & discounts.keys():
                     # A case can fail after earlier selected cases completed.
                     # Charge the filtered batch's full estimate in that event.
                     net = pass_chance * gain - estimate
