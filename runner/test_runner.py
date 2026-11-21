@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from . import PatchError, Session
+from . import GENERATOR_MEMORY, PatchError, Session
 
 
 class RunnerTest(unittest.TestCase):
@@ -113,6 +113,31 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(r.ran, ids[2:3])
         self.assertEqual(r.failing, set(r.ran))
         self.assertIsNone(r.import_error)
+
+    def test_dialect_case_filter(self):
+        self.put("tests/test_generator.py", """
+            import enum, unittest
+            class Dialects(enum.Enum):
+                A, B, C = range(3)
+            original = Dialects
+            class TestGenerator(unittest.TestCase):
+                def test_generator_memory(self):
+                    for member in Dialects:
+                        with self.subTest(member=member):
+                            self.assertNotEqual(member, original.B)
+                    if original.B not in Dialects:
+                        self.assertEqual(list(Dialects), [original.A, original.C])
+                def tearDown(self):
+                    self.assertIs(Dialects, original)
+                def test_restored(self):
+                    self.assertIs(Dialects, original)
+        """)
+        ids = [GENERATOR_MEMORY, GENERATOR_MEMORY.replace("test_generator_memory", "test_restored")]
+        for names, failures in [(["C", "A"], set()), (["B"], {ids[0]})]:
+            result = self.session.run("", ids, case_filter={ids[0]: names})
+            self.assertEqual(result.ran, ids)
+            self.assertEqual(result.failing, failures)
+            self.assertEqual(result.notes, [])
 
     def test_module_setup_and_teardown(self):
         for phase in ("setUpModule", "tearDownModule", "tearDownClass"):

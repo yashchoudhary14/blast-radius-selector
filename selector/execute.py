@@ -4,7 +4,9 @@ import resource
 import time
 from collections import defaultdict
 
+from runner import GENERATOR_MEMORY
 from .analyze import numbers
+from .dialect_cases import DialectCases
 from .patch_proof import PatchProof
 from .proxies import can_prove_pass
 from .workers import schedule
@@ -36,6 +38,8 @@ class Execution:
         self.analyzer, self.millis = analyzer, millis
         self.ids = {t["number"]: t["id"] for t in tests}
         self.num = {node: n for n, node in self.ids.items()}
+        self.memory = self.num.get(GENERATOR_MEMORY)
+        self.dialects = DialectCases(analyzer.maps)
         self.files = {t["number"]: t["file"] for t in tests}
         self.body = {n: PER_SECOND * ms / 1000 for n, ms in millis.items()}
         for n, total in SINGLE.items():
@@ -84,6 +88,47 @@ class Execution:
 
         if get_session is None:
             return conservative(selected)
+        subset = self.dialects.subset(candidates) if self.memory is not None else None
+        if subset is not None:
+            subset_cost = self.setup({self.files[self.memory]}) + .2 * len(subset)
+        memory_passed = False
+
+        def include_importers():
+            for path in candidates.python_paths:
+                selected.update(numbers(self.analyzer.importers[path] | self.analyzer.index["all_hits"].get(path, 0)))
+            if memory_passed:
+                selected.discard(self.memory)
+
+        def probe_memory():
+            # A standalone test includes collection and stops at the first
+            # failing dialect, even when other probes already found failures.
+            nonlocal memory_passed
+            budget = deadline - time.monotonic()
+            if subset_cost > budget:
+                return
+            start = cpu_time()
+            result = get_session().run(patch, [GENERATOR_MEMORY], stop_on_first_fail=True,
+                                       overall_timeout=budget, case_filter={GENERATOR_MEMORY: subset})
+            passed = (result.ran == [GENERATOR_MEMORY] and not result.failing
+                      and not result.import_error and "incomplete child run" not in result.notes)
+            log(f"dialects {commit} cases={len(subset)} passed={int(passed)} "
+                f"est={subset_cost:.3f} cpu={cpu_time()-start:.6f}")
+            if passed:
+                memory_passed = True
+                selected.discard(self.memory)
+                potential_observers.discard(self.memory)
+                protected.discard(self.memory)
+            else:
+                selected.add(self.memory)
+                protected.add(self.memory)
+                if result.failing:
+                    failed.add(self.memory)
+                if result.import_error:
+                    include_importers()
+            observed.add(self.memory)
+
+        if subset is not None and self.memory in selected:
+            probe_memory()
         proof = root = None
         tried_replay = set()
 
@@ -104,8 +149,7 @@ class Execution:
             if bad:
                 protected.update(potential_observers)
             if result.import_error:
-                for path in candidates.python_paths:
-                    selected.update(numbers(self.analyzer.importers[path] | self.analyzer.index["all_hits"].get(path, 0)))
+                include_importers()
             complete = "incomplete child run" not in result.notes
             ran = {self.num[node] for node in result.ran}
             if complete and not result.import_error:
@@ -195,4 +239,11 @@ class Execution:
             root = None  # Session.run removes its overlay.
             if not run(best, not failed):
                 break
-        return conservative(selected)
+        selected = conservative(selected)
+        if subset is not None and self.memory in selected and self.memory not in observed:
+            # An additional heap observer can enter only after another probe.
+            # Price this optional follow-up against its marginal schedule gain.
+            gain = self.cost(selected) - self.cost(selected - {self.memory})
+            if .5 * gain > subset_cost:
+                probe_memory()
+        return selected

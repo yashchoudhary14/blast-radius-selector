@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .cases import execute
+from .cases import GENERATOR_MEMORY, execute
 from .overlay import PatchError, changes, populate
 from .process import child_pipe
 from .warm import preload, project_modules
@@ -62,7 +62,7 @@ def _enter_tree(root, base, warmed):
     main.__spec__ = None
 
 
-def _child(fd, root, base, ids, deadlines, early, warmed):
+def _child(fd, root, base, ids, deadlines, early, warmed, case_filter):
     def send(*event):
         data = json.dumps(event, separators=(",", ":")).encode() + b"\n"
         while data:
@@ -73,7 +73,7 @@ def _child(fd, root, base, ids, deadlines, early, warmed):
             os.dup2(sink.fileno(), 1)
             os.dup2(sink.fileno(), 2)
         _enter_tree(root, base, warmed)
-        execute(ids, deadlines, early, send)
+        execute(ids, deadlines, early, send, case_filter)
         send("done")
         os._exit(0)
     except BaseException as exc:
@@ -171,11 +171,13 @@ class Session:
             raise
 
     def run(self, patch_text, test_ids, *, timeout_factor=10.0, stop_on_first_fail=False,
-            per_test_budget=None, overall_timeout=None):
+            per_test_budget=None, overall_timeout=None, case_filter=None):
         self._clear()
         try:
             edits = changes(self.base, patch_text)
             ids = list(dict.fromkeys(test_ids))
+            if case_filter and set(case_filter) - ({GENERATOR_MEMORY} & set(ids)):
+                raise ValueError("case filters require a selected generator-memory test")
             if not ids:
                 return RunResult()
             warm = self.warm_fixtures and self.base == Path("/sqlglot") and edits and all(
@@ -193,7 +195,7 @@ class Session:
             deadline = time.monotonic() + guard
             start = _usage()
             with child_pipe(_child, self._root, self.base, ids, deadlines, stop_on_first_fail,
-                            self._warm if warm else None) as rd:
+                            self._warm if warm else None, case_filter) as rd:
                 result = _collect(rd, ids, deadline)
             result.cpu_s = _usage() - start
             return result

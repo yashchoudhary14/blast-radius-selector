@@ -160,6 +160,7 @@ class Candidates:
     priority: int = 0
     broken: bool = False
     python_paths: list[str] = field(default_factory=list)
+    dialect_subset_safe: bool = True
 
     @property
     def mask(self):
@@ -274,12 +275,15 @@ class Analyzer:
             out.direct |= readers
             out.priority |= readers
             if new is None or not (self.base / path).exists():
+                out.dialect_subset_safe = False
                 directory = p.parent
                 while not (self.base / directory).is_dir():
                     directory = directory.parent
                 out.broad |= self.index["dirs"].get(directory.as_posix(), 0)
             if p.suffix == ".py":
                 out.python_paths.append(path)
+                if not path.startswith("sqlglot/"):
+                    out.dialect_subset_safe = False
                 self.python(path, new, out, prioritize=prioritize)
         return out
 
@@ -298,6 +302,16 @@ class Analyzer:
             return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
+        # Module statements, top-level definition order, and class/function
+        # headers execute at import. Ignore changes confined to their bodies.
+        if out.dialect_subset_safe:
+            out.dialect_subset_safe = (
+                old_scopes.get("") == new_scopes.get("")
+                and all(old_scopes.get(q, (None,))[0] == scope[0]
+                        for q, scope in new_scopes.items() if q and "." not in q)
+                and all(old_funcs.get(q, (None, None))[1] == fn[1]
+                        for q, fn in new_funcs.items() if "." not in q)
+            )
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
         scope_edit = bool(dirty)

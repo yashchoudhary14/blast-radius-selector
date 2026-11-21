@@ -4,7 +4,30 @@ import importlib
 import signal
 import unittest
 from collections import defaultdict
+from functools import wraps
 from itertools import groupby
+
+
+GENERATOR_MEMORY = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+
+def filter_dialects(case, module, names):
+    method = getattr(case, case._testMethodName)
+    wanted = set(names)
+
+    @wraps(method)
+    def filtered():
+        original = module.Dialects
+        members = [member for member in original if member.name in wanted]
+        if len(members) != len(wanted):
+            raise ValueError("unknown Dialects member in case filter")
+        try:
+            module.Dialects = members
+            return method()
+        finally:
+            module.Dialects = original
+
+    setattr(case, case._testMethodName, filtered)
 
 
 class TimedOut(BaseException):
@@ -125,7 +148,7 @@ class Suite(unittest.TestSuite):
         return result
 
 
-def execute(ids, deadlines, early, send):
+def execute(ids, deadlines, early, send, case_filter=None):
     modules = {}
     for index, node in enumerate(ids):
         file, cls, method = node.split("::")
@@ -164,6 +187,8 @@ def execute(ids, deadlines, early, send):
                         return cases
                     continue
                 case._runner_index = idx
+                if case_filter and ids[idx] in case_filter:
+                    filter_dialects(case, imported, case_filter[ids[idx]])
                 klass = type(case)
                 result.by_scope[klass.__module__].append(idx)
                 result.by_scope[f"{klass.__module__}.{klass.__qualname__}"].append(idx)

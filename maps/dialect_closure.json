@@ -1,0 +1,549 @@
+{
+  "common": [
+    "sqlglot/__init__.py",
+    "sqlglot/_typing.py",
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/diff.py",
+    "sqlglot/errors.py",
+    "sqlglot/expressions/__init__.py",
+    "sqlglot/expressions/aggregate.py",
+    "sqlglot/expressions/array.py",
+    "sqlglot/expressions/builders.py",
+    "sqlglot/expressions/constraints.py",
+    "sqlglot/expressions/core.py",
+    "sqlglot/expressions/datatypes.py",
+    "sqlglot/expressions/ddl.py",
+    "sqlglot/expressions/dml.py",
+    "sqlglot/expressions/functions.py",
+    "sqlglot/expressions/json.py",
+    "sqlglot/expressions/math.py",
+    "sqlglot/expressions/properties.py",
+    "sqlglot/expressions/query.py",
+    "sqlglot/expressions/string.py",
+    "sqlglot/expressions/temporal.py",
+    "sqlglot/generator.py",
+    "sqlglot/helper.py",
+    "sqlglot/jsonpath.py",
+    "sqlglot/optimizer/__init__.py",
+    "sqlglot/optimizer/scope.py",
+    "sqlglot/parser.py",
+    "sqlglot/parsers/__init__.py",
+    "sqlglot/parsers/base.py",
+    "sqlglot/parsers/snowflake.py",
+    "sqlglot/schema.py",
+    "sqlglot/time.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/tokens.py",
+    "sqlglot/trie.py",
+    "sqlglot/typing/__init__.py"
+  ],
+  "cases": [
+    {
+      "name": "DIALECT",
+      "paths": [],
+      "wall_s": 0.028846,
+      "cpu_s": 0.02884
+    },
+    {
+      "name": "ATHENA",
+      "paths": [
+        "sqlglot/dialects/athena.py",
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/dialects/presto.py",
+        "sqlglot/dialects/trino.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/athena.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/generators/presto.py",
+        "sqlglot/generators/trino.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/athena.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/parsers/presto.py",
+        "sqlglot/parsers/trino.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/mysql.py",
+        "sqlglot/typing/presto.py"
+      ],
+      "wall_s": 0.172806,
+      "cpu_s": 0.172748
+    },
+    {
+      "name": "BIGQUERY",
+      "paths": [
+        "sqlglot/dialects/bigquery.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/bigquery.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/bigquery.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/bigquery.py"
+      ],
+      "wall_s": 0.108832,
+      "cpu_s": 0.107921
+    },
+    {
+      "name": "CLICKHOUSE",
+      "paths": [
+        "sqlglot/dialects/clickhouse.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/clickhouse.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/optimizer/simplify.py",
+        "sqlglot/parsers/clickhouse.py",
+        "sqlglot/typing/clickhouse.py"
+      ],
+      "wall_s": 0.091317,
+      "cpu_s": 0.091282
+    },
+    {
+      "name": "DATABRICKS",
+      "paths": [
+        "sqlglot/dialects/databricks.py",
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/spark.py",
+        "sqlglot/dialects/spark2.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/databricks.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/spark.py",
+        "sqlglot/generators/spark2.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/databricks.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/spark.py",
+        "sqlglot/parsers/spark2.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/databricks.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/spark.py",
+        "sqlglot/typing/spark2.py"
+      ],
+      "wall_s": 0.088519,
+      "cpu_s": 0.088507
+    },
+    {
+      "name": "DAX",
+      "paths": [
+        "sqlglot/dialects/dax.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/dax.py",
+        "sqlglot/parsers/dax.py"
+      ],
+      "wall_s": 0.044981,
+      "cpu_s": 0.044969
+    },
+    {
+      "name": "DORIS",
+      "paths": [
+        "sqlglot/dialects/doris.py",
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/doris.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/parsers/doris.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/mysql.py"
+      ],
+      "wall_s": 0.072718,
+      "cpu_s": 0.072705
+    },
+    {
+      "name": "DREMIO",
+      "paths": [
+        "sqlglot/dialects/dremio.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/dremio.py",
+        "sqlglot/parsers/dremio.py"
+      ],
+      "wall_s": 0.046839,
+      "cpu_s": 0.046828
+    },
+    {
+      "name": "DRILL",
+      "paths": [
+        "sqlglot/dialects/drill.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/drill.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/parsers/drill.py",
+        "sqlglot/transforms.py"
+      ],
+      "wall_s": 0.053986,
+      "cpu_s": 0.053971
+    },
+    {
+      "name": "DRUID",
+      "paths": [
+        "sqlglot/dialects/druid.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/druid.py",
+        "sqlglot/parsers/druid.py"
+      ],
+      "wall_s": 0.045322,
+      "cpu_s": 0.045308
+    },
+    {
+      "name": "DUCKDB",
+      "paths": [
+        "sqlglot/dialects/duckdb.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/duckdb.py",
+        "sqlglot/parsers/duckdb.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/duckdb.py"
+      ],
+      "wall_s": 0.120715,
+      "cpu_s": 0.120702
+    },
+    {
+      "name": "DUNE",
+      "paths": [
+        "sqlglot/dialects/dune.py",
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/dialects/presto.py",
+        "sqlglot/dialects/trino.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/dune.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/generators/presto.py",
+        "sqlglot/generators/trino.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/dune.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/parsers/presto.py",
+        "sqlglot/parsers/trino.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/mysql.py",
+        "sqlglot/typing/presto.py"
+      ],
+      "wall_s": 0.119067,
+      "cpu_s": 0.119053
+    },
+    {
+      "name": "FABRIC",
+      "paths": [
+        "sqlglot/dialects/fabric.py",
+        "sqlglot/dialects/tsql.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/fabric.py",
+        "sqlglot/generators/tsql.py",
+        "sqlglot/parsers/fabric.py",
+        "sqlglot/parsers/tsql.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/tsql.py"
+      ],
+      "wall_s": 0.077956,
+      "cpu_s": 0.077945
+    },
+    {
+      "name": "HIVE",
+      "paths": [
+        "sqlglot/dialects/hive.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py"
+      ],
+      "wall_s": 0.062059,
+      "cpu_s": 0.062047
+    },
+    {
+      "name": "MATERIALIZE",
+      "paths": [
+        "sqlglot/dialects/materialize.py",
+        "sqlglot/dialects/postgres.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/materialize.py",
+        "sqlglot/generators/postgres.py",
+        "sqlglot/parsers/materialize.py",
+        "sqlglot/parsers/postgres.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/postgres.py"
+      ],
+      "wall_s": 0.072074,
+      "cpu_s": 0.072062
+    },
+    {
+      "name": "MYSQL",
+      "paths": [
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/mysql.py"
+      ],
+      "wall_s": 0.074655,
+      "cpu_s": 0.074643
+    },
+    {
+      "name": "ORACLE",
+      "paths": [
+        "sqlglot/dialects/oracle.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/oracle.py",
+        "sqlglot/parsers/oracle.py",
+        "sqlglot/transforms.py"
+      ],
+      "wall_s": 0.05078,
+      "cpu_s": 0.050766
+    },
+    {
+      "name": "POSTGRES",
+      "paths": [
+        "sqlglot/dialects/postgres.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/postgres.py",
+        "sqlglot/parsers/postgres.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/postgres.py"
+      ],
+      "wall_s": 0.065381,
+      "cpu_s": 0.06536
+    },
+    {
+      "name": "PRESTO",
+      "paths": [
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/dialects/presto.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/generators/presto.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/parsers/presto.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/mysql.py",
+        "sqlglot/typing/presto.py"
+      ],
+      "wall_s": 0.118125,
+      "cpu_s": 0.118092
+    },
+    {
+      "name": "PRQL",
+      "paths": [
+        "sqlglot/dialects/prql.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/prql.py",
+        "sqlglot/parsers/prql.py"
+      ],
+      "wall_s": 0.037476,
+      "cpu_s": 0.037466
+    },
+    {
+      "name": "REDSHIFT",
+      "paths": [
+        "sqlglot/dialects/postgres.py",
+        "sqlglot/dialects/redshift.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/postgres.py",
+        "sqlglot/generators/redshift.py",
+        "sqlglot/parsers/postgres.py",
+        "sqlglot/parsers/redshift.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/postgres.py",
+        "sqlglot/typing/redshift.py"
+      ],
+      "wall_s": 0.068183,
+      "cpu_s": 0.068169
+    },
+    {
+      "name": "RISINGWAVE",
+      "paths": [
+        "sqlglot/dialects/postgres.py",
+        "sqlglot/dialects/risingwave.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/postgres.py",
+        "sqlglot/generators/risingwave.py",
+        "sqlglot/parsers/postgres.py",
+        "sqlglot/parsers/risingwave.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/postgres.py"
+      ],
+      "wall_s": 0.054398,
+      "cpu_s": 0.054372
+    },
+    {
+      "name": "SNOWFLAKE",
+      "paths": [
+        "sqlglot/dialects/snowflake.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/snowflake.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/snowflake.py"
+      ],
+      "wall_s": 0.050665,
+      "cpu_s": 0.05065
+    },
+    {
+      "name": "SOLR",
+      "paths": [
+        "sqlglot/dialects/solr.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/solr.py",
+        "sqlglot/parsers/solr.py"
+      ],
+      "wall_s": 0.029735,
+      "cpu_s": 0.029705
+    },
+    {
+      "name": "SPARK",
+      "paths": [
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/spark.py",
+        "sqlglot/dialects/spark2.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/spark.py",
+        "sqlglot/generators/spark2.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/spark.py",
+        "sqlglot/parsers/spark2.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/spark.py",
+        "sqlglot/typing/spark2.py"
+      ],
+      "wall_s": 0.100224,
+      "cpu_s": 0.100208
+    },
+    {
+      "name": "SPARK2",
+      "paths": [
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/spark2.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/spark2.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/spark2.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/spark2.py"
+      ],
+      "wall_s": 0.091809,
+      "cpu_s": 0.091796
+    },
+    {
+      "name": "SQLITE",
+      "paths": [
+        "sqlglot/dialects/sqlite.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/sqlite.py",
+        "sqlglot/parsers/sqlite.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/sqlite.py"
+      ],
+      "wall_s": 0.065873,
+      "cpu_s": 0.065859
+    },
+    {
+      "name": "STARROCKS",
+      "paths": [
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/dialects/starrocks.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/generators/starrocks.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/parsers/starrocks.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/mysql.py"
+      ],
+      "wall_s": 0.072623,
+      "cpu_s": 0.07261
+    },
+    {
+      "name": "TABLEAU",
+      "paths": [
+        "sqlglot/dialects/tableau.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/tableau.py",
+        "sqlglot/parsers/tableau.py",
+        "sqlglot/transforms.py"
+      ],
+      "wall_s": 0.044756,
+      "cpu_s": 0.044744
+    },
+    {
+      "name": "TERADATA",
+      "paths": [
+        "sqlglot/dialects/teradata.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/teradata.py",
+        "sqlglot/parsers/teradata.py",
+        "sqlglot/transforms.py"
+      ],
+      "wall_s": 0.055884,
+      "cpu_s": 0.055868
+    },
+    {
+      "name": "TRINO",
+      "paths": [
+        "sqlglot/dialects/hive.py",
+        "sqlglot/dialects/mysql.py",
+        "sqlglot/dialects/presto.py",
+        "sqlglot/dialects/trino.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/hive.py",
+        "sqlglot/generators/mysql.py",
+        "sqlglot/generators/presto.py",
+        "sqlglot/generators/trino.py",
+        "sqlglot/optimizer/annotate_types.py",
+        "sqlglot/parsers/hive.py",
+        "sqlglot/parsers/mysql.py",
+        "sqlglot/parsers/presto.py",
+        "sqlglot/parsers/trino.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/hive.py",
+        "sqlglot/typing/mysql.py",
+        "sqlglot/typing/presto.py"
+      ],
+      "wall_s": 0.116013,
+      "cpu_s": 0.115979
+    },
+    {
+      "name": "TSQL",
+      "paths": [
+        "sqlglot/dialects/tsql.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/tsql.py",
+        "sqlglot/parsers/tsql.py",
+        "sqlglot/transforms.py",
+        "sqlglot/typing/tsql.py"
+      ],
+      "wall_s": 0.044973,
+      "cpu_s": 0.044954
+    },
+    {
+      "name": "EXASOL",
+      "paths": [
+        "sqlglot/dialects/exasol.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/generators/exasol.py",
+        "sqlglot/parsers/exasol.py"
+      ],
+      "wall_s": 0.034453,
+      "cpu_s": 0.034444
+    }
+  ]
+}
