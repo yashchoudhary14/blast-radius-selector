@@ -237,6 +237,12 @@ class Candidates:
     query_spans: dict | None = field(default_factory=dict)
     query_blocked: int = 0
     query_subsets: dict = field(default_factory=dict)
+    reasons: list[tuple[str, str]] = field(default_factory=list)
+    paths: tuple[str, ...] = ()
+
+    def mark_broken(self, reason, path):
+        self.broken = True
+        self.reasons.append((reason, path))
 
     @property
     def mask(self):
@@ -749,7 +755,7 @@ class Analyzer:
                 status, rows = probe()
                 if status == "broken" and out is not None:
                     out.broad |= coverage | self.importers[path] | self.file_tests[path]
-                    out.broken = True
+                    out.mark_broken("docstring-state-broken", path)
                     return 0
                 if status == "ok" and all(r[1] == "__doc__" for r in rows):
                     return self.doc_observers() | loc
@@ -796,7 +802,7 @@ class Analyzer:
                     status, _ = probe()
                     if status == "broken" and out is not None:
                         out.broad |= coverage | self.importers[path] | self.file_tests[path]
-                        out.broken = True
+                        out.mark_broken("signature-state-broken", path)
                         return 0
                     if status != "ok":
                         return None
@@ -806,6 +812,7 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
+        out.paths = tuple(edits)
         isolated_tests = self.isolated_test_edits(edits)
         # Only verified test-method edits can accompany a single production edit.
         production_count = len(edits) - len(isolated_tests)
@@ -877,6 +884,7 @@ class Analyzer:
                     out.dialect_subset_safe = False
             if new is None or created:
                 out.structural = True
+                out.reasons.append(("path-created" if created else "path-deleted", path))
                 out.dialect_subset_safe = False
                 directory = p.parent
                 while not (self.base / directory).is_dir():
@@ -887,7 +895,7 @@ class Analyzer:
                 # pytest reads these at startup (markers, addopts, filterwarnings=error, plugins): any test
                 # can change outcome, and the unittest probes never load them.
                 out.broad |= self.all_tests
-                out.broken = True
+                out.mark_broken("pytest-config", path)
                 continue
             if p.suffix == ".py":
                 out.python_paths.append(path)
@@ -897,12 +905,12 @@ class Analyzer:
                         # The full suite can observe writes from a module or test
                         # that an isolated execution probe never loads or runs.
                         out.broad |= self.all_tests
-                        out.broken = True
+                        out.mark_broken("interpreter-settings", path)
                         continue
                 if p.name == "conftest.py" and (p.parent == Path(".") or p.parts[0] == "tests"):
                     # Even a nested conftest can change the entire item list.
                     out.broad |= self.all_tests
-                    out.broken = True
+                    out.mark_broken("conftest", path)
                     continue
                 if path.startswith("tests/") and (p.match("test_*.py") or p.match("*_test.py")
                                                   or self.importers[path]):
@@ -910,7 +918,7 @@ class Analyzer:
                         # Shared changes during full-suite collection are invisible to
                         # probes that import only the test modules they execute.
                         out.broad |= self.all_tests
-                        out.broken = True
+                        out.mark_broken("collection-actions", path)
                         continue
                 if created:
                     lookup = p.parent.as_posix() + ".py" if p.name == "__init__.py" else path
@@ -937,6 +945,7 @@ class Analyzer:
                     out.broad |= test.broad
                     out.priority |= test.priority
                     out.broken |= test.broken
+                    out.reasons.extend(test.reasons)
                     consumers = (self.file_tests[path] | self.importers[path]
                                  | self.index["all_hits"].get(path, 0) | test.mask | readers)
                     out.query_blocked |= consumers
@@ -1309,12 +1318,12 @@ class Analyzer:
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
-            out.broken = True
+            out.mark_broken("module-deleted" if new is None else "compile-error", path)
             return
         if diagnostics and diagnostics != self.old_compiled(path)[1]:
             # The grader can promote a compile-time warning to an import error.
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
-            out.broken = True
+            out.mark_broken("compile-warning", path)
             return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
@@ -1639,7 +1648,7 @@ class Analyzer:
                         if import_clean is None:
                             status, rows = probe()
                             if status == "broken":
-                                out.broken = True
+                                out.mark_broken("body-state-broken", path)
                                 out.broad |= coverage | self.importers[path]
                                 return None
                             import_clean = (status == "ok" and all((r[0], r[1]) in changed_symbols for r in rows))
@@ -1769,12 +1778,12 @@ class Analyzer:
             reason, mark_broken = skip_reason()
             if reason is not None:
                 if mark_broken:
-                    out.broken = True
+                    out.mark_broken(f"state-skipped-{reason}", path)
                 print(f"state {path} status=skipped reason={reason}", file=sys.stderr)
             else:
                 status, rows = probe()
                 if status == "broken":
-                    out.broken = True
+                    out.mark_broken("scope-state-broken", path)
                     out.broad |= coverage | self.importers[path]
                     return
                 if status == "ok" and not changed:

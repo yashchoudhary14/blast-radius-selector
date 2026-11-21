@@ -114,6 +114,7 @@ class Execution:
         def include_importers():
             for path in candidates.python_paths:
                 selected.update(numbers(self.analyzer.importers[path] | self.analyzer.index["all_hits"].get(path, 0)))
+                candidates.reasons.append(("probe-import-error", path))
             if memory_passed:
                 selected.discard(self.memory)
 
