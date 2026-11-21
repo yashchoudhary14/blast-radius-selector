@@ -34,11 +34,16 @@ def candidates(tree):
                     yield file, start + part.index(token), token
 
 
+def signature(patch):
+    return tuple(line for line in patch.splitlines() if line.startswith((b"diff --git ", b"+", b"-")))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tree", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--exclude", nargs="+", type=Path, default=[], help="existing patch directories")
     args = parser.parse_args()
     rng = random.Random(855731)
     pool = list(candidates(args.tree))
@@ -46,10 +51,12 @@ def main():
     (root / "commits").mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.manifest, root / "tests.json")
     rng.shuffle(pool)
-    seen = set()
+    excluded = {signature(patch.read_bytes()) for directory in args.exclude for patch in directory.glob("*.patch")}
+    seen, written = set(), 0
     for file, start, token in pool:
         if (file, start) in seen:
             continue
+        seen.add((file, start))
         path = file.relative_to(args.tree).as_posix()
         raw = file.read_bytes().replace(b"\r\n", b"\n")
         after = rng.choice(FLIPS[token.decode()]).encode()
@@ -57,13 +64,18 @@ def main():
         compile(revised, path, "exec")
         diff = difflib.diff_bytes(difflib.unified_diff, raw.splitlines(True), revised.splitlines(True),
                                   ("a/" + path).encode(), ("b/" + path).encode())
-        key = f"r{len(seen):03d}"
-        (root / "commits" / (key + ".patch")).write_bytes(
-            f"diff --git a/{path} b/{path}\n".encode() + b"".join(diff))
-        seen.add((file, start))
-        if len(seen) == 300:
+        patch = f"diff --git a/{path} b/{path}\n".encode() + b"".join(diff)
+        fingerprint = signature(patch)
+        if fingerprint in excluded:
+            continue
+        excluded.add(fingerprint)
+        (root / "commits" / f"r{written:03d}.patch").write_bytes(patch)
+        written += 1
+        if written == 300:
             break
-    print(f"{len(seen)} distinct mutants from {len(pool)} eligible token locations")
+    print(f"{written} distinct mutants from {len(pool)} eligible token locations")
+    if written != 300:
+        raise SystemExit("insufficient distinct mutants")
 
 
 if __name__ == "__main__":
