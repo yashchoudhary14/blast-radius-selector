@@ -17,15 +17,18 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
+from .config_edits import added_methods, configuration_changes
 from .dialect_cases import isolated_test_methods
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
+from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (added_binding, compile_source, dead_statement, docstring_edit, extracted_expression,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
                                  relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
                                  text_message_only)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
+from .test_edits import method_changes
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -224,6 +227,7 @@ class Candidates:
     structural: bool = False
     python_paths: list[str] = field(default_factory=list)
     dialect_subset_safe: bool = True
+    isolated_test_paths: dict = field(default_factory=dict)
     query_spans: dict | None = field(default_factory=dict)
     query_blocked: int = 0
     query_subsets: dict = field(default_factory=dict)
@@ -777,9 +781,16 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
+        isolated_tests = self.isolated_test_edits(edits)
+        # Only verified test-method edits can accompany a single production edit.
+        production_count = len(edits) - len(isolated_tests)
+        registrations = self.expression_additions(edits)
+        new_classes = {name for additions in registrations.values() for name, _ in additions.values()}
         for directory in edits.removed_dirs:
             out.broad |= self.index["dirs"].get(Path(directory).parent.as_posix(), 0)
-        from runner import Session
+        from runner import GENERATOR_MEMORY, Session
+        memory = self.num.get(GENERATOR_MEMORY)
+        memory_bit = 0 if memory is None else 1 << memory
         @lru_cache(maxsize=1)
         def state():
             now = time.monotonic()
@@ -797,32 +808,43 @@ class Analyzer:
                   file=sys.stderr)
             return status, rows
 
-        probe = state if (allow_probe
+        probe = state if (allow_probe and production_count
                           and (run_until is None or time.monotonic() < run_until)
                           and (deadline is None or time.monotonic() < deadline)
-                          and all(p.startswith("sqlglot/") and p.endswith(".py")
+                          and all(p in isolated_tests or (
+                                  p.startswith("sqlglot/") and p.endswith(".py")
                                   and p != "sqlglot/__main__.py" and data is not None
-                                  and (self.base / p).is_file() for p, data in edits.items())) else None
+                                  and (self.base / p).is_file()) for p, data in edits.items())) else None
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
+            dialect_test = path.startswith("tests/dialects/") and p.match("test_*.py")
+            out.direct |= readers
+            out.priority |= readers
+            if readers & memory_bit:
+                out.dialect_subset_safe = False
+            isolated_mask = isolated_tests.get(path)
+            if isolated_mask is not None:
+                mask = isolated_mask | readers
+                out.isolated_test_paths[path] = mask
+                out.direct |= isolated_mask
+                out.priority |= isolated_mask
+                out.query_blocked |= mask
+                if mask & (self.index["heap_observers"] | memory_bit):
+                    out.dialect_subset_safe = False
+                if not dialect_test:
+                    out.python_paths.append(path)
+                    continue
             created = new is not None and not (self.base / path).is_file()
             ordinary_test_edit = (
-                path.startswith("tests/dialects/") and p.match("test_*.py")
-                and not created and new is not None and not readers
+                dialect_test and not created and new is not None and not readers
                 and isolated_test_methods((self.base / path).read_bytes(), new)
             )
-            if ordinary_test_edit:
-                consumers = self.file_tests[path] | self.importers[path] | self.index["all_hits"].get(path, 0)
-                out.query_blocked |= consumers
-                if consumers & self.index["heap_observers"]:
-                    out.dialect_subset_safe = False
-            elif new is None or not (path.startswith("sqlglot/") and p.suffix == ".py" and not created):
+            if not ordinary_test_edit and (new is None or not (
+                    path.startswith("sqlglot/") and p.suffix == ".py" and not created)):
                 out.query_spans = None
                 if p.suffix == ".py" or readers & self.index["heap_observers"]:
                     out.dialect_subset_safe = False
-            out.direct |= readers
-            out.priority |= readers
             if new is None or created:
                 out.structural = True
                 out.dialect_subset_safe = False
@@ -876,15 +898,171 @@ class Analyzer:
                     # Packaging scripts and examples may be read or executed by path.
                     out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
                     continue
-                query_spans = out.query_spans
-                if ordinary_test_edit:
+                if ordinary_test_edit or isolated_mask is not None:
+                    # Attribute the test edit separately so its consumers cannot
+                    # use partial probes, even if production already selected them.
+                    test = Candidates(query_spans=None)
+                    self.python(path, new, test, prioritize=prioritize)
+                    out.direct |= test.direct
+                    out.broad |= test.broad
+                    out.priority |= test.priority
+                    out.broken |= test.broken
+                    consumers = (self.file_tests[path] | self.importers[path]
+                                 | self.index["all_hits"].get(path, 0) | test.mask | readers)
+                    out.query_blocked |= consumers
+                    if not test.dialect_subset_safe or consumers & (self.index["heap_observers"] | memory_bit):
+                        out.dialect_subset_safe = False
+                    continue
+                if path in registrations:
+                    out.broad |= self.expression_readers(registrations[path])
                     out.query_spans = None
-                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=len(edits) == 1,
-                            operand_safe=len(edits) == 1)
-                if ordinary_test_edit:
-                    out.query_spans = query_spans
+                    continue
+                if path.startswith("sqlglot/typing/") and new is not None:
+                    mask = self.typing_readers(path, new, new_classes)
+                    if mask is not None:
+                        out.broad |= mask
+                        out.query_spans = None
+                        continue
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
+                            operand_safe=production_count == 1)
         out.query_subsets = self.queries.subsets(out, edits)
         return out
+
+    @lru_cache(maxsize=1)
+    def expression_exports(self):
+        names = set()
+        for file in (self.base / "sqlglot/expressions").glob("*.py"):
+            path = file.relative_to(self.base).as_posix()
+            tree, _ = self.old_tree_and_lines(path)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.add(node.name.lower())
+                elif isinstance(node, ast.alias):
+                    names.add((node.asname or node.name.split(".")[0]).lower())
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    names.add(node.id.lower())
+        return names
+
+    def expression_additions(self, edits):
+        if edits.keys() & {"sqlglot/expressions/core.py", "sqlglot/expressions/__init__.py", "sqlglot/helper.py"}:
+            return {}
+        additions = {}
+        seen = set()
+        for path, new in edits.items():
+            if (not path.startswith("sqlglot/expressions/") or not path.endswith(".py")
+                    or new is None or not (self.base / path).is_file()):
+                continue
+            try:
+                old, _ = self.old_tree_and_lines(path)
+                found = added_expressions(old, ast.parse(new), self.expression_exports())
+                if not found:
+                    continue
+                _, diagnostics = compile_source(new, path)
+            except (ValueError, SyntaxError):
+                continue
+            if not diagnostics:
+                if seen.intersection(found):
+                    return {}
+                seen.update(found)
+                additions[path] = found
+        return additions
+
+    @lru_cache(maxsize=1)
+    def function_registry_readers(self):
+        # These module initializers just propagate the registry into dispatch
+        # tables. The consumers are subsequent lookups and whole-table users.
+        mask = 0
+        for name in ("ALL_FUNCTIONS", "FUNCTION_BY_NAME", "FUNCTIONS"):
+            for path, lines in self.state_refs.refs.get(name, {}).items():
+                if path == "sqlglot/expressions/__init__.py":
+                    continue
+                if path == "sqlglot/parser.py" and name == "FUNCTION_BY_NAME":
+                    continue
+                if path.startswith("sqlglot/parsers/") and path != "sqlglot/parsers/prql.py":
+                    continue
+                if path == "sqlglot/generators/python.py" and name == "ALL_FUNCTIONS":
+                    mask |= self.index["runtime"].get(path, 0)
+                    continue
+                mask |= self._lines_and_indirect_mask(path, lines)
+        return mask
+
+    def expression_readers(self, registrations):
+        mask = self.doc_observers() | self.state_refs.mask("EXPR_CLASSES") | self.state_refs.mask("*module")
+        if any(is_function for _, is_function in registrations.values()):
+            mask |= self.function_registry_readers()
+        for name, _ in registrations.values():
+            mask |= self.state_refs.mask(name)
+        return mask
+
+    def binding_users(self, path):
+        return (self.importers[path] | self.index["runtime"].get(path, 0)
+                | self.dialects.get(Path(path).stem, 0))
+
+    @lru_cache(maxsize=1)
+    def dtypes(self):
+        tree, _ = self.old_tree_and_lines("sqlglot/expressions/datatypes.py")
+        dtype = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DType")
+        return {target.id for stmt in dtype.body if isinstance(stmt, ast.Assign)
+                for target in stmt.targets if isinstance(target, ast.Name)}
+
+    def typing_readers(self, path, new, new_classes):
+        try:
+            before = ast.parse((self.base / path).read_bytes())
+            classes, dtypes = changed_metadata(before, ast.parse(new))
+            if not classes or not dtypes <= self.dtypes():
+                return None
+            if not all(not name.startswith("_") and (name in new_classes or self.expr_owners(path, {name}))
+                       for name in classes):
+                return None
+            _, diagnostics = compile_source(new, path)
+        except (ValueError, SyntaxError):
+            return None
+        if diagnostics:
+            return None
+        # Dialect class initialization only copies these tables. Run the
+        # annotator's lookup users and tests that inspect metadata wholesale.
+        mask = self.state_refs.mask("expression_metadata") | self.doc_observers()
+        for reader, lines in self.state_refs.refs.get("EXPRESSION_METADATA", {}).items():
+            if not reader.startswith(("sqlglot/typing/", "sqlglot/dialects/")):
+                mask |= self._lines_and_indirect_mask(reader, lines)
+        return mask & self.binding_users(path)
+
+    def isolated_test_edits(self, edits):
+        found = {}
+        for path, source in edits.items():
+            p = Path(path)
+            old_file = self.base / path
+            if (source is None or not path.startswith("tests/") or p.suffix != ".py"
+                    or not (p.match("test_*.py") or p.match("*_test.py")) or not old_file.is_file()):
+                continue
+            old_mode = old_file.stat().st_mode & 0o777
+            if edits.modes.get(path, old_mode) != old_mode:
+                continue
+            original = old_file.read_bytes()
+            if interpreter_settings(original) != interpreter_settings(source):
+                continue
+            mask = self.isolated_tests(path, original, source)
+            if mask is not None:
+                found[path] = mask
+        return found
+
+    def isolated_tests(self, path, original, new):
+        try:
+            methods = method_changes(original, new)
+            if not methods:
+                return None
+            _, diagnostics = compile_source(new, path)
+        except (ValueError, SyntaxError):
+            return None
+        if diagnostics:
+            return None
+        # The catalog includes inherited methods. Also retain code that calls
+        # a method explicitly and observers that inspect the edited module.
+        mask = (self.location_observers() & self.importers[path])
+        for name in methods:
+            mask |= self.methods[path + "::" + name]
+            mask |= self.state_refs.mask(name.rsplit(".", 1)[1])
+        return mask
 
     @lru_cache(maxsize=1)
     def _test_star_imports(self):
@@ -993,7 +1171,7 @@ class Analyzer:
             return False
         return True
 
-    def _dict_value_candidates(self, path, old_tree, new_bytes, rows):
+    def _dict_value_candidates(self, path, old_tree, new_bytes, rows=None):
         if not self.dict_reads:
             return None
         old_dicts, old_amb = _class_dict_nodes(old_tree)
@@ -1017,7 +1195,8 @@ class Analyzer:
                 if ast.dump(ok) != ast.dump(nk):
                     return None
                 if ast.dump(od.values[idx]) != ast.dump(nd.values[idx]):
-                    if did not in tracked:
+                    if did not in tracked or (rows is None and (
+                            not _inert_dict_value(od.values[idx]) or not _inert_dict_value(nd.values[idx]))):
                         return None
                     changed_idxs.append(idx)
             if changed_idxs:
@@ -1032,7 +1211,7 @@ class Analyzer:
             tracked[did]["import_whole"] or any(idx in tracked[did]["import_keys"] for idx in idxs)
             for did, idxs in changed_dicts.items()
         )
-        for row in rows:
+        for row in rows or ():
             if (row[0], row[1]) not in expected_owners and not has_import_value_reads:
                 return None
         mask = self.dict_reads["incomplete"]
@@ -1049,6 +1228,45 @@ class Analyzer:
             for mod in imp_mods:
                 mask |= self.importers.get(mod, 0) | self.file_tests.get(mod, 0)
         return mask
+
+    def _dict_key_candidates(self, path, new):
+        """Use named lookup evidence for string keys and retain whole-table users."""
+        before = ast.parse((self.base / path).read_bytes())
+        after = ast.parse(new)
+        left, left_ambiguous = _class_dict_nodes(before)
+        right, right_ambiguous = _class_dict_nodes(after)
+        if left_ambiguous or right_ambiguous or left.keys() != right.keys():
+            return None
+        changes = {}
+        for owner, attr in left:
+            old, revised = left[owner, attr], right[owner, attr]
+            if len(old.keys) == len(revised.keys):
+                continue
+            if not attr.isupper() or attr.startswith("_"):
+                return None
+            old_keys = _literal_string_keys(old)
+            new_keys = _literal_string_keys(revised)
+            if old_keys is None or new_keys is None:
+                return None
+            removed, added = old_keys - new_keys, new_keys - old_keys
+            if not (removed or added):
+                return None
+            for mapping, keys in ((old, removed), (revised, added)):
+                entries = []
+                for key, value in zip(mapping.keys, mapping.values):
+                    if key is None or key.value not in keys:
+                        entries.append((key, value))
+                    elif not _inert_dict_value(value):
+                        return None
+                mapping.keys = [key for key, _ in entries]
+                mapping.values = [value for _, value in entries]
+            changes.setdefault(attr, set()).update(removed | added)
+        if not changes or ast.dump(before) != ast.dump(after):
+            return None
+        mask = self.location_observers()
+        for attr, keys in changes.items():
+            mask |= self.state_refs.mask(attr, tuple(sorted(keys)))
+        return mask & self.binding_users(path)
 
     def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True):
         coverage = self.index["all_hits"].get(path, 0)
@@ -1070,6 +1288,33 @@ class Analyzer:
             return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
+        dirty = {q for q in old_scopes.keys() | new_scopes.keys()
+                 if scope_changed(old_scopes.get(q), new_scopes.get(q))}
+        dialect_code = (path in {"sqlglot/parser.py", "sqlglot/generator.py"}
+                        or path.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/")))
+        if self.dict_reads and not diagnostics and dirty and dialect_code:
+            old_tree, _ = self.old_tree_and_lines(path)
+            dict_mask = self._dict_value_candidates(path, old_tree, new)
+            if dict_mask is None:
+                dict_mask = self._dict_key_candidates(path, new)
+            if dict_mask is not None:
+                out.broad |= dict_mask | (self.location_observers() & self.importers[path])
+                out.query_spans = None
+                return
+        if dialect_code and not diagnostics and old_funcs.keys() < new_funcs.keys():
+            old_tree, _ = self.old_tree_and_lines(path)
+            methods = added_methods(old_tree, ast.parse(new, path))
+            if methods:
+                mask = self.signature_observers(path)
+                for method in methods:
+                    mask |= self.state_refs.mask(method)
+                    if method.endswith("_sql") and not method.startswith("_"):
+                        # The generator enumerates these names and dispatches
+                        # by expression key even without a direct attribute read.
+                        mask |= self.state_refs.mask("EXPR_CLASSES")
+                out.broad |= mask & self.binding_users(path)
+                out.query_spans = None
+                return
         if single_edit and not diagnostics and path.startswith("sqlglot/"):
             headers = [q for q, fn in new_funcs.items() if old_funcs.get(q, (None, None))[1] != fn[1]]
             scope_edits = old_scopes != new_scopes
@@ -1095,8 +1340,15 @@ class Analyzer:
                 and all(old_funcs.get(q, (None, None))[1] == fn[1]
                         for q, fn in new_funcs.items() if "." not in q)
             )
-        dirty = {q for q in old_scopes.keys() | new_scopes.keys()
-                 if scope_changed(old_scopes.get(q), new_scopes.get(q))}
+        configuration = set()
+        if dirty and dialect_code:
+            configuration = configuration_changes(path, (self.base / path).read_bytes(), new)
+            if configuration:
+                dirty.clear()
+                out.broad |= self.location_observers() & self.importers[path]
+                out.broad |= self.state_refs.mask("__annotations__") & self.binding_users(path)
+                for field in configuration:
+                    out.broad |= self.state_refs.mask(field) & self.binding_users(path)
         scope_edit = bool(dirty)
         if old_scopes != new_scopes or old_funcs.keys() != new_funcs.keys():
             out.query_spans = None
@@ -1263,7 +1515,16 @@ class Analyzer:
                 imp_mods = self.import_modules.get(path, {})
                 imp_hits = self.import_hits.get(path, {})
                 c_hits = self.cache_hits.get(path, {})
-                for ln in _changed_old_lines(base_bytes, new):
+                touched = _changed_old_lines(base_bytes, new)
+                if configuration:
+                    # Ignore declaration lines accounted for by their readers.
+                    # This includes unchanged neighbors of inserted flags.
+                    body_lines = set()
+                    for q, (_, _, signature, start, end) in old_funcs.items():
+                        if signature != new_funcs[q][2]:
+                            body_lines.update(range(start, end + 1))
+                    touched &= body_lines
+                for ln in touched:
                     if ln in skip or ln in equivalent:
                         continue
                     if (include_probe and not scope_edit and changed and all_body_only and single_edit and probe
@@ -1496,6 +1757,25 @@ class _MaskLambdas(ast.NodeTransformer):
         self.frames.append((bindings, generator))
         node.body = ast.copy_location(ast.Constant(value="<lambda>"), node.body)
         return self.generic_visit(node)
+
+
+def _inert_dict_value(node):
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.Tuple):
+        return all(_inert_dict_value(item) for item in node.elts)
+    if isinstance(node, ast.Lambda):
+        return all(value is None or isinstance(value, ast.Constant)
+                   for value in (*node.args.defaults, *node.args.kw_defaults))
+    return False
+
+
+def _literal_string_keys(mapping):
+    explicit = [key for key in mapping.keys if key is not None]
+    if not all(isinstance(key, ast.Constant) and type(key.value) is str for key in explicit):
+        return None
+    keys = {key.value for key in explicit}
+    return keys if len(keys) == len(explicit) else None
 
 
 def _class_dict_nodes(tree):
