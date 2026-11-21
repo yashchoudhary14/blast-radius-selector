@@ -61,6 +61,19 @@ def preamble(tree):
     return tree.body[start:end]
 
 
+def new_private_functions(old, new, postponed):
+    old_names = {node.name for node in old.body if isinstance(node, ast.FunctionDef)}
+    functions = [node for node in new.body
+                 if isinstance(node, ast.FunctionDef) and node.name not in old_names
+                 and node.name.startswith("_") and not node.name.startswith("__")
+                 and not node.decorator_list and not getattr(node, "type_params", ())
+                 and not node.args.defaults and not any(value is not None for value in node.args.kw_defaults)
+                 and (postponed or (node.returns is None and not any(
+                     arg.annotation for arg in ast.walk(node.args) if isinstance(arg, ast.arg))))]
+    names = {node.name for node in functions}
+    return functions if len(functions) == len(names) else []
+
+
 def import_order(statements):
     """Preserve each uncached import's position relative to cached bindings."""
     sections = []
@@ -103,6 +116,8 @@ def bindings(before, after, path):
         start = new.body.index(new_imports[0])
         new.body[start:start + len(new_imports)] = old_imports
     moved = list(map(ast.dump, old_imports)) != list(map(ast.dump, retained))
+    functions = new_private_functions(old, new, postponed) if allow_imports else []
+    fresh.update(fn.name for fn in functions)
 
     def declarations(tree):
         rows = [(name, node) for node in tree.body if (name := declaration(node, postponed))]
@@ -122,7 +137,8 @@ def bindings(before, after, path):
         return None
     for name in values:
         right[name].value = left[name].value
-    new.body = [node for node in new.body if node not in {right[name] for name in additions}]
+    omitted = {right[name] for name in additions} | set(functions)
+    new.body = [node for node in new.body if node not in omitted]
     if ast.dump(old) != ast.dump(new) or not _same_directives_text_only(before, after):
         return None
     return values, fresh

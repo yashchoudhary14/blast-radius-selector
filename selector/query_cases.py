@@ -103,7 +103,7 @@ class QueryCases:
         self.maps = {analyzer.num[node]: row for node, row in data.items() if node in analyzer.num}
         self._tpcds_weights = None
 
-    def binding_readers(self, path, edits, heavy):
+    def binding_readers(self, path, edits, eligible):
         analyzer = self.analyzer
         original = analyzer.base / path
         source = edits[path]
@@ -125,7 +125,7 @@ class QueryCases:
         if path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/", "sqlglot/expressions/")):
             # The corresponding lazy packages and serde can resolve names by string.
             observers |= analyzer.state_refs.mask("*module")
-        readers = heavy & observers
+        readers = eligible & observers
         for name in values | fresh:
             for ref_path in analyzer.state_refs.refs.get(name, ()):
                 lines = reference_lines(analyzer, ref_path, name, name in values)
@@ -133,7 +133,7 @@ class QueryCases:
                     continue
                 for number in self.maps:
                     bit = 1 << number
-                    if heavy & bit and not readers & bit:
+                    if eligible & bit and not readers & bit:
                         _, masks, files = self.maps[number]
                         if reached_cases(masks, files, ref_path, ((line, line) for line in lines)):
                             readers |= bit
@@ -169,10 +169,10 @@ class QueryCases:
         blocked = candidates.query_blocked
         proved_bindings = set()
         heavy_mask = sum(1 << n for n in self.maps if analyzer.ids[n] in (TPCDS, MAX_NODES))
-        heavy = candidates.mask & heavy_mask & ~blocked
-        if heavy and not candidates.structural:
+        traced = sum(1 << n for n in self.maps) & candidates.mask & ~blocked
+        if traced and not candidates.structural:
             for path in sorted(unresolved):
-                readers = self.binding_readers(path, edits, heavy)
+                readers = self.binding_readers(path, edits, traced)
                 if readers is not None:
                     blocked |= readers
                     proved_bindings.add(path)
@@ -199,7 +199,7 @@ class QueryCases:
                 continue
             count, masks, files = self.maps[number]
             is_heavy = bool(bit & heavy_mask)
-            if not is_heavy and (opaque or candidates.query_heavy_only):
+            if not is_heavy and (unresolved or candidates.query_heavy_only):
                 continue
             if opaque and (candidates.structural or any(
                 path in files or (analyzer.importers[path] | analyzer.index["all_hits"].get(path, 0)) & bit

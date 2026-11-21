@@ -3,7 +3,7 @@
 import ast
 
 from .dialect_tables import concrete, same_directive_lines
-from .query_bindings import declaration
+from .query_bindings import bindings, declaration
 
 
 def scalar_kind(node):
@@ -61,8 +61,17 @@ def same_memory_workload(analyzer, edits, bit):
         return False
     original, _ = analyzer.old_tree_and_lines(path)
     fields = constants(original, revised, path)
-    if not fields or not same_directive_lines(file.read_bytes(), revised):
+    before = file.read_bytes()
+    if not same_directive_lines(before, revised):
         return False
+    if not fields:
+        binding_change = bindings(before, revised, path)
+        if binding_change is None:
+            return False
+        values, added = binding_change
+        if values or not added or any(not name.startswith("_") for name in added):
+            return False
+        fields = added
     # These assignments execute once, before the allocation loop. Their
     # values cannot change class construction, warmup or the measured loop
     # without a reader in one of those phases.

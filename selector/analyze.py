@@ -28,6 +28,7 @@ from .dialect_time import time_changes, time_readers
 from .fixture_cases import unaffected_fixture_tests
 from .memory_edits import same_memory_workload
 from .operands import narrow
+from .parser_payload import unchanged_limit_assertions
 from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
@@ -1049,6 +1050,11 @@ class Analyzer:
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
+        number = self.num.get(MAX_NODES)
+        if (not out.broken and not out.structural and number in self.queries.maps
+                and out.mask & ~out.query_blocked & (1 << number)
+                and unchanged_limit_assertions(self, edits, 1 << number)):
+            out.query_subsets[number] = []
         if (not out.broken and production_count and
                 edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}):
             for test in (MAX_NODES, TPCDS):
