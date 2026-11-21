@@ -24,7 +24,10 @@ def check(patch, tests):
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
         if run.returncode not in (0, 1, 5) or not report.exists():
             raise RuntimeError(f"{patch.name}: {run.stdout[-3000:].decode(errors='replace')}")
-        return read_report(report, {"tests": tests})
+        failures = read_report(report, {"tests": tests})
+        if failures:
+            print(f"{patch.name}: {run.stdout[-3000:].decode(errors='replace')}", file=sys.stderr, flush=True)
+        return failures
 
 
 def main():
