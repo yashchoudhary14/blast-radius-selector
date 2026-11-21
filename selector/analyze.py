@@ -296,6 +296,25 @@ class Analyzer:
                     mask |= hits.get(index, 0)
         return mask
 
+    @property
+    def all_tests(self):
+        mask = 0
+        for t in self.tests:
+            mask |= 1 << t["number"]
+        return mask
+
+    def _pytest_config(self, p, new):
+        """Config files pytest discovers from the rootdir or from tests/ upward (probe adv: filterwarnings)."""
+        if p.name not in ("pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"):
+            return False
+        parent = p.parent.as_posix()
+        if parent not in (".", "") and parent != "tests" and not parent.startswith("tests/"):
+            return False
+        if p.name in ("pytest.ini", ".pytest.ini"):
+            return True
+        old = (self.base / p).read_bytes() if (self.base / p).is_file() else b""
+        return b"pytest" in old.lower() or b"pytest" in (new or b"").lower()
+
     def analyze(self, patch, *, prioritize=False):
         out = Candidates()
         edits = changes(self.base, patch)
@@ -318,6 +337,12 @@ class Analyzer:
                     out.broad |= self.index["missing_imports"].get(directory.as_posix() + ".py", 0)
                     directory = directory.parent
                 out.broad |= self.index["dirs"].get(directory.as_posix(), 0)
+            if self._pytest_config(p, new):
+                # pytest reads these at startup (markers, addopts, filterwarnings=error, plugins): any test
+                # can change outcome, and the unittest probes never load them.
+                out.broad |= self.all_tests
+                out.broken = True
+                continue
             if p.suffix == ".py":
                 out.python_paths.append(path)
                 if not path.startswith("sqlglot/"):
