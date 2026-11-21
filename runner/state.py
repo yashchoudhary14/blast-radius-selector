@@ -1,6 +1,7 @@
 """Compare the import-time object graph in isolated, production-only interpreters."""
 import enum
 import functools
+import gc
 import hashlib
 import importlib
 import marshal
@@ -12,8 +13,27 @@ from pathlib import Path
 
 BASELINE = Path("/app/maps/import-state.bin")
 SCALAR = (type(None), bool, int, str, bytes, float, complex)
+SIMPLE_SCALAR = (type(None), bool, int, str, bytes)
 SKIP = {"__loader__", "__spec__", "__cached__", "__file__", "__path__", "__builtins__",
         "__dict__", "__weakref__", "__firstlineno__", "__warningregistry__"}
+_BASELINE_CACHE = None
+
+
+def preload():
+    global _BASELINE_CACHE
+    if _BASELINE_CACHE is None:
+        with BASELINE.open("rb") as source:
+            nodes, original, unordered, old_aliases = marshal.load(source)
+        ids = {node: i for i, node in enumerate(nodes)}
+        scalar_ids = {}
+        for i, node in enumerate(nodes):
+            if node[0] == "atom":
+                val = marshal.loads(node[1])
+                if type(val) in SIMPLE_SCALAR:
+                    scalar_ids[(type(val), val)] = i
+        _BASELINE_CACHE = (nodes, ids, scalar_ids, original, unordered, old_aliases)
+        gc.freeze()
+    return _BASELINE_CACHE
 
 
 class ImportFailure(Exception):
@@ -34,9 +54,10 @@ def code_parts(code, encode):
 class Graph:
     """Intern structural nodes. Shared class objects are named edges to separate scopes."""
 
-    def __init__(self, nodes):
+    def __init__(self, nodes, ids=None, scalar_ids=None):
         self.nodes = nodes
-        self.ids = {node: i for i, node in enumerate(nodes)}
+        self.ids = {node: i for i, node in enumerate(nodes)} if ids is None else ids
+        self.scalar_ids = {} if scalar_ids is None else scalar_ids
         self.memo = {}
         self.roots = {}
         self.classes = {}
@@ -53,6 +74,13 @@ class Graph:
 
     def ref(self, obj):
         typ = type(obj)
+        if typ in SIMPLE_SCALAR:
+            key = (typ, obj)
+            i = self.scalar_ids.get(key)
+            if i is None:
+                i = self.intern(("atom", marshal.dumps(obj, 2)))
+                self.scalar_ids[key] = i
+            return i
         if typ in SCALAR:
             # Marshal retains signed zero, scalar type, and arbitrary integer widths.
             return self.intern(("atom", marshal.dumps(obj, 2)))
@@ -199,9 +227,14 @@ class Graph:
 
 
 def diff(root, *, calibrate=False, details=False):
-    with BASELINE.open("rb") as source:
-        nodes, original, unordered, old_aliases = marshal.load(source)
-    graph = Graph(nodes)
+    if not calibrate and _BASELINE_CACHE is not None:
+        base_nodes, base_ids, base_scalars, original, unordered, old_aliases = _BASELINE_CACHE
+        nodes = base_nodes.copy()
+        graph = Graph(nodes, base_ids.copy(), base_scalars.copy())
+    else:
+        with BASELINE.open("rb") as source:
+            nodes, original, unordered, old_aliases = marshal.load(source)
+        graph = Graph(nodes)
     updated = graph.capture(root)
     aliases = graph.aliases()
     result = {}

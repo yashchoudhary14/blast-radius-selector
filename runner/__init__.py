@@ -166,6 +166,9 @@ def _state_child(fd, root, base, warm):
 
 def _fork_state(root, base, deadline, *, warm):
     start = _usage()
+    if warm:
+        from .state import preload
+        preload()
     data = bytearray()
     with child_pipe(_state_child, root, base, warm) as fd:
         while len(data) < 1048576:
