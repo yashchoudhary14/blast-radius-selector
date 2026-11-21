@@ -83,7 +83,7 @@ def configuration_changes(path, original, updated):
     return {name for _, name in changed}
 
 
-def added_methods(old, new):
+def added_methods(old, new, *, allow_body_edits=False):
     """Accept ordinary methods whose definitions execute no new user code."""
     postponed = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
                     and any(name.name == "annotations" for name in node.names) for node in old.body)
@@ -97,7 +97,18 @@ def added_methods(old, new):
         if ast.get_docstring(cls, clean=False) != ast.get_docstring(classes[cls.name], clean=False):
             return set()
         # An existing binding may be a descriptor or an alias, not a def.
-        bound = {node.id for node in ast.walk(classes[cls.name]) if isinstance(node, ast.Name)}
+        if allow_body_edits:
+            definition_time = []
+            for stmt in classes[cls.name].body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    definition_time.extend(stmt.decorator_list)
+                    definition_time.extend(d for d in (*stmt.args.defaults, *stmt.args.kw_defaults) if d is not None)
+                else:
+                    definition_time.append(stmt)
+            bound = {node.id for stmt in definition_time for node in ast.walk(stmt)
+                     if isinstance(node, ast.Name)}
+        else:
+            bound = {node.id for node in ast.walk(classes[cls.name]) if isinstance(node, ast.Name)}
         bound.update(node.name for node in classes[cls.name].body
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
         retained = []
@@ -111,4 +122,12 @@ def added_methods(old, new):
             bound.add(node.name)
             methods.add(node.name)
         cls.body = retained
+    if not methods:
+        return set()
+    if allow_body_edits:
+        before, old_scopes = snapshot(old, b"")
+        after, new_scopes = snapshot(new, b"")
+        old_headers = {name: row[1] for name, row in before.items()}
+        new_headers = {name: row[1] for name, row in after.items()}
+        return methods if old_scopes == new_scopes and old_headers == new_headers else set()
     return methods if ast.dump(old) == ast.dump(new) else set()

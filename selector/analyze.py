@@ -3,6 +3,7 @@
 import argparse
 import ast
 import gzip
+import inspect
 import json
 import marshal
 import math
@@ -18,12 +19,14 @@ from runner.overlay import changes
 
 from .collect import BASE, MAPS
 from .config_edits import added_methods, configuration_changes
+from .core_headers import inert_header, only_nested_definitions, shared_core
 from .dialect_cases import isolated_test_methods
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
-from .source_equivalence import (added_binding, compile_source, dead_statement, docstring_edit, extracted_expression,
+from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
+                                 dead_statement, docstring_edit, extracted_expression,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
                                  relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
                                  text_message_only)
@@ -150,13 +153,16 @@ def _collect_blocks_and_stmts(func_node):
     return blocks, stmts
 
 
-def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node):
+def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node, *, skip_header=False):
     if func_node is None or new_func_node is None:
         return None
     f_start = min([func_node.lineno, *(d.lineno for d in func_node.decorator_list)])
     f_end = func_node.end_lineno or func_node.lineno
     nf_start = min([new_func_node.lineno, *(d.lineno for d in new_func_node.decorator_list)])
     nf_end = new_func_node.end_lineno or new_func_node.lineno
+    if skip_header:
+        f_start = func_node.body[0].lineno
+        nf_start = new_func_node.body[0].lineno
 
     old_slice = old_lines[f_start - 1 : f_end]
     new_slice = new_lines[nf_start - 1 : nf_end]
@@ -523,6 +529,25 @@ class Analyzer:
             mask |= hits.get(q, 0)
         return mask
 
+    def _argument_readers(self, name):
+        """Ignore uses that only call the existing callable with zero arguments."""
+        mask = 0
+        for path, lines in self.state_refs.refs.get(name, {}).items():
+            tree, _ = self.old_tree_and_lines(path)
+            empty_calls = {node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
+                           and not node.args and not node.keywords}
+            safe, other = set(), set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == name:
+                    target = safe if node in empty_calls else other
+                    target.update((node.lineno, node.end_lineno))
+                elif ((isinstance(node, ast.Name) and node.id == name)
+                      or (isinstance(node, ast.Constant) and node.value == name)
+                      or (isinstance(node, ast.alias) and node.name == name)):
+                    other.add(node.lineno)
+            mask |= self._lines_and_indirect_mask(path, set(lines) - (safe - other))
+        return mask
+
     @lru_cache(maxsize=1)
     def doc_observers(self):
         mask = self._dynamic_other_mask()
@@ -786,6 +811,7 @@ class Analyzer:
         production_count = len(edits) - len(isolated_tests)
         registrations = self.expression_additions(edits)
         new_classes = {name for additions in registrations.values() for name, _ in additions.values()}
+        shared_edit = any(shared_core(path) for path in edits)
         for directory in edits.removed_dirs:
             out.broad |= self.index["dirs"].get(Path(directory).parent.as_posix(), 0)
         from runner import GENERATOR_MEMORY, Session
@@ -840,7 +866,11 @@ class Analyzer:
                 dialect_test and not created and new is not None and not readers
                 and isolated_test_methods((self.base / path).read_bytes(), new)
             )
-            if not ordinary_test_edit and (new is None or not (
+            fixture_edit = (shared_edit and not created and new is not None and p.suffix == ".sql"
+                            and path.startswith("tests/fixtures/optimizer/") and readers)
+            if fixture_edit:
+                out.query_blocked |= readers
+            if not ordinary_test_edit and not fixture_edit and (new is None or not (
                     path.startswith("sqlglot/") and p.suffix == ".py" and not created)):
                 out.query_spans = None
                 if p.suffix == ".py" or readers & self.index["heap_observers"]:
@@ -1350,6 +1380,25 @@ class Analyzer:
                 for field in configuration:
                     out.broad |= self.state_refs.mask(field) & self.binding_users(path)
         scope_edit = bool(dirty)
+        plain_methods = set()
+        if (path in {"sqlglot/parser.py", "sqlglot/generator.py"} and not scope_edit
+                and old_funcs.keys() != new_funcs.keys()):
+            original = (self.base / path).read_bytes()
+            if _same_directives_text_only(original, new):
+                if old_funcs.keys() < new_funcs.keys():
+                    plain_methods = added_methods(ast.parse(original), ast.parse(new), allow_body_edits=True)
+                elif path == "sqlglot/generator.py" and new_funcs.keys() < old_funcs.keys():
+                    removed = added_methods(ast.parse(new), ast.parse(original), allow_body_edits=True)
+                    if all(name.endswith("_sql") and not name.startswith("_") for name in removed):
+                        plain_methods = removed
+            if plain_methods:
+                observers = self.signature_observers(path, args_changed=False) | self.location_observers()
+                observers |= self.index["heap_observers"] & self.importers[path]
+                for name in plain_methods:
+                    observers |= self.state_refs.mask(name)
+                    if path == "sqlglot/generator.py" and name.endswith("_sql") and not name.startswith("_"):
+                        observers |= self.expression_keys().get(name[:-4], 0)
+                out.broad |= observers
         if old_scopes != new_scopes or old_funcs.keys() != new_funcs.keys():
             out.query_spans = None
         if dirty:
@@ -1397,6 +1446,24 @@ class Analyzer:
         def same_layout():
             return pinned_layout(self.base, path) == frame_layout(compiled)
 
+        safe_headers = {}
+        if shared_core(path) and not scope_edit:
+            changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
+                               if old_funcs[q][1] != new_funcs[q][1]]
+            if changed_headers:
+                original = (self.base / path).read_bytes()
+                old_tree, _ = self.old_tree_and_lines(path)
+                before, old_diagnostics = self.old_compiled(path)
+                if not old_diagnostics and _same_directives_text_only(original, new):
+                    for q in changed_headers:
+                        fn_old = _get_func_node(old_tree, q)
+                        fn_new = _get_func_node(new_tree_for_stmts, q)
+                        kind = inert_header(fn_old, fn_new, before.co_flags, compiled.co_flags)
+                        if kind:
+                            safe_headers[q] = kind
+                            h0, h1 = _header_span(fn_old)
+                            header_skip.update(range(h0, h1 + 1))
+
         for q in old_funcs.keys() | new_funcs.keys():
             old, revised = old_funcs.get(q), new_funcs.get(q)
             if old and revised and old[2] == revised[2]:
@@ -1416,6 +1483,19 @@ class Analyzer:
                         continue
             changed = True
             owner, _, method = q.rpartition(".")
+            kind = safe_headers.get(q)
+            if kind:
+                observers = self.annotation_observers() | (self.index["heap_observers"] & self.importers[path])
+                if kind != "annotation":
+                    observers |= self.signature_observers(path) | self.state_refs.mask("signature")
+                    # A binding error happens before the first body line. A
+                    # suspended callable may also never execute its body.
+                    old_code = self.old_code(path).get(q)
+                    suspended = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+                    if kind == "add" or old_code is None or old_code.co_flags & suspended:
+                        observers |= self._argument_readers(method.split("#")[0])
+                out.direct |= observers
+                out.query_blocked |= observers
             if bool(old) != bool(revised):
                 name = method.split("#")[0]
                 if owner in old_scopes and owner in new_scopes and name.startswith("__") and name.endswith("__"):
@@ -1430,7 +1510,7 @@ class Analyzer:
                     if expr_mask and (path == "sqlglot/generator.py" or path.startswith(
                             ("sqlglot/generators/", "sqlglot/dialects/"))):
                         out.broad |= expr_mask | (self.index["heap_observers"] & self.importers[path])
-            if old and revised and old[1] == revised[1]:
+            if old and revised and (old[1] == revised[1] or kind == "annotation"):
                 # Only function body changed: use statement-level granularity
                 old_tree, old_lines = self.old_tree_and_lines(path)
                 fn_old = _get_func_node(old_tree, q)
@@ -1444,11 +1524,18 @@ class Analyzer:
                     changed_symbols.add((f"{mod_name}.{owner}", method.split("#")[0]))
                 # A local introduced on an untaken branch can rebind a name
                 # throughout the frame. Include callers of unaffected lines too.
-                frame_changed = not same_layout() and changes_frame_bindings(
-                    self.old_code(path).get(q), code.get(q)
-                )
+                frame_changed = False
+                if not same_layout():
+                    if code is None:
+                        code = functions(compiled)
+                    frame_changed = changes_frame_bindings(self.old_code(path).get(q), code.get(q))
+                if safe_headers and same_layout():
+                    children = {child.rsplit(".", 1)[-1] for child, child_kind in safe_headers.items()
+                                if child.rpartition(".")[0] == q and child_kind == "annotation"}
+                    if (kind or children) and only_nested_definitions(fn_old, fn_new, children):
+                        continue
                 spans = None if frame_changed else _changed_stmt_spans(
-                    fn_old, old_lines, new.splitlines(), fn_new
+                    fn_old, old_lines, new.splitlines(), fn_new, skip_header=kind == "annotation"
                 )
                 if out.query_spans is not None:
                     safe = body_spans(fn_old, fn_new, spans)
@@ -1469,10 +1556,10 @@ class Analyzer:
                 else:
                     out.direct |= hits.get(q, 0)
             elif old:
-                all_body_only = False
+                all_body_only &= bool(kind)
                 # Def header changed or function deleted: all tests executing any line of function body
                 out.direct |= hits.get(q, 0)
-                if not revised:
+                if not revised and method not in plain_methods:
                     l_hits = self.line_hits(path)
                     for ln in range(old[3], old[4] + 1):
                         out.direct |= l_hits.get(ln, 0)
@@ -1481,8 +1568,12 @@ class Analyzer:
                 same = self.index["by_name"].get(method.split("#")[0], 0)
                 out.broad |= (same & runtime) or same
             if old and revised and old[1] != revised[1]:
-                out.query_spans = None
-                dirty.add(owner)
+                if not kind:
+                    out.query_spans = None
+                    dirty.add(owner)
+                elif out.query_spans is not None and kind != "annotation":
+                    before_node = _get_func_node(old_tree, q)
+                    out.query_spans.setdefault(path, []).append((before_node.body[0].lineno, old[4]))
             if old and not revised and not owner:
                 # A removed binding can break a from-import in a test that
                 # never invoked the function on the baseline.
@@ -1524,6 +1615,21 @@ class Analyzer:
                         if signature != new_funcs[q][2]:
                             body_lines.update(range(start, end + 1))
                     touched &= body_lines
+                elif plain_methods:
+                    # A new def between two methods did not change either
+                    # neighbor's body. Attribute only actual body edits.
+                    touched = set()
+                    before_lines = base_bytes.splitlines(keepends=True)
+                    after_lines = new.splitlines(keepends=True)
+                    for q, (_, _, signature, start, end) in old_funcs.items():
+                        revised = new_funcs.get(q)
+                        if revised is None:
+                            node = _get_func_node(self.old_tree_and_lines(path)[0], q)
+                            touched.update(range(node.body[0].lineno, end + 1))
+                        elif signature != revised[2]:
+                            left = b"".join(before_lines[start - 1:end])
+                            right = b"".join(after_lines[revised[3] - 1:revised[4]])
+                            touched.update(start + n - 1 for n in _changed_old_lines(left, right) if 0 < n <= end - start + 1)
                 for ln in touched:
                     if ln in skip or ln in equivalent:
                         continue
