@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+import gzip
 import json
 import marshal
 import sys
@@ -192,6 +193,24 @@ class Analyzer:
         for file, paths in self.index["collect_imports"].items():
             for path in paths:
                 self.importers[path] |= self.file_tests[file]
+        with gzip.open(maps / "import_lines.json.gz") as source:
+            imports = json.load(source)
+        masks = []
+        for modules in imports["sets"]:
+            mask = 0
+            for module in modules:
+                mask |= self.importers[module]
+            masks.append(mask)
+        self.indirect_hits = {path: {int(ln): masks[idx] for ln, idx in rows.items()}
+                              for path, rows in imports["files"].items()}
+        for cache in imports["caches"]:
+            users = 0
+            for path, ln in cache["reads"]:
+                users |= self.line_hits(path).get(ln, 0) | self.indirect_hits.get(path, {}).get(ln, 0)
+            for path, lines in cache["files"].items():
+                rows = self.indirect_hits.setdefault(path, {})
+                for ln in lines:
+                    rows[ln] = rows.get(ln, 0) | users
         for file, (reads, directories) in self.index["collection_reads"].items():
             for key, paths in (("reads", reads), ("dirs", directories)):
                 masks = self.index[key]
@@ -278,6 +297,7 @@ class Analyzer:
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
+        scope_edit = bool(dirty)
         if dirty:
             # Class/module-level edits that sit entirely inside lambda bodies (e.g. entries of
             # Parser.FUNCTIONS / Generator.TRANSFORMS dicts) are code, not data: a lambda body runs
@@ -342,6 +362,10 @@ class Analyzer:
                     dirty.add(owner)
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
+        import_rows = self.indirect_hits.get(path)
+        if import_rows and (scope_edit or changed):
+            for ln in _changed_old_lines((self.base / path).read_bytes(), new):
+                out.broad |= import_rows.get(ln, 0)
         if not dirty:
             return
         # A heap observer is a candidate if it executes the changed code (normal coverage rule),
@@ -438,9 +462,20 @@ def _changed_old_lines(old_bytes, new_bytes):
     old = old_bytes.splitlines()
     new = new_bytes.splitlines() if isinstance(new_bytes, (bytes, bytearray)) else new_bytes.encode().splitlines()
     lines = set()
-    for op, i1, i2, _, _ in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+    start = 0
+    shared = min(len(old), len(new))
+    while start < shared and old[start] == new[start]:
+        start += 1
+    a, b = len(old), len(new)
+    while a > start and b > start and old[a - 1] == new[b - 1]:
+        a -= 1
+        b -= 1
+    edits = SequenceMatcher(None, old[start:a], new[start:b], autojunk=False)
+    for op, i1, i2, _, _ in edits.get_opcodes():
         if op == "equal":
             continue
+        i1 += start
+        i2 += start
         if i1 == i2:
             lines.update((i1, i1 + 1))
         else:

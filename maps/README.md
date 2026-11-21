@@ -4,6 +4,7 @@ These files describe the numbered tests at SQLGlot commit `eb11aec4be8cb2122afe7
 
 | File | JSON format |
 | --- | --- |
+| `import_lines.json.gz` | `sets` interns sorted lists of importing module paths. `files[path][line]` indexes the modules whose initialization executed that source line. `caches` links measured cold-only fill lines to lookup sites. |
 | `lines.json.gz` | `{"sets":[[test_number,...],...],"files":{"path.py":{"line":set_index,...},...}}`. The zero-based index selects a sorted, unique list of test numbers. Every package and test Python file has a key. A line without a numbered test has no key. |
 | `modlevel.json.gz` | `{"path.py":[line,...],...}`. Sorted lines reached while importing the pinned files in module and class definition scopes. Includes executed decorators, default expressions and definition lines. An empty list is valid. |
 | `reads.json.gz` | `{"path":[test_number,...],...}`. Each sorted list identifies tests that opened an existing file under the checkout with read access, including Python sources opened as data. |
@@ -30,5 +31,7 @@ The collector runs the complete suite twice with coverage.py's C tracer and `SKI
 Each numbered context spans setup through teardown. Shared fixture contexts expand to their class or module. Python children inherit the active context, and process-pool tasks carry it into reused workers. A subtest failure or setup/teardown error takes precedence over a passing call report. If a numbered test passes normally but fails or skips after preload, the builder prints its node ID and takes all its line coverage, including shared fixtures and child processes, from the normal run.
 
 The separate file-read and import maps retain their original collection order. The original cold collector in `lab/coverage/build_maps.py` also measures durations and module-definition lines.
+
+Use `powershell -NoProfile -ExecutionPolicy Bypass -File lab/coverage/rebuild.ps1 -ImportsOnly` to rebuild just the import map. A fresh interpreter switches coverage contexts on entry to each pinned source loader and restores the enclosing context on return. It resolves all dialects, constructs their tokenizer/parser/generator, and imports the package and test trees. Only work during module execution receives a module owner. The builder also measures cold fills and warm lookups for the generator dispatch table and the dialect class registry. It exercises registry lookup by name, subscript, and enumeration with the pinned dialect modules loaded. At selection time, cold-only lines inherit the numbered tests and module importers that reached a warm lookup.
 
 `lab/coverage/check_recall.py` reports the union size and missing test numbers for each sample commit. It uses exact old lines for deletions and replacements. For added lines it includes the closest covered line in the same revised function with a corresponding old coordinate, including both neighbors on a tie. It unions file readers for non-Python paths. Precision and recall use total commit–test pairs. Module-level impact beyond measured execution and changes to previously unexecuted paths can produce misses.
