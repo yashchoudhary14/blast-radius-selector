@@ -16,6 +16,7 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
+from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
@@ -405,7 +406,8 @@ class Analyzer:
                     # Packaging scripts and examples may be read or executed by path.
                     out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
                     continue
-                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=(len(edits) == 1))
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=(len(edits) == 1),
+                            operand_safe=len(edits) == 1)
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 
@@ -516,7 +518,7 @@ class Analyzer:
             return False
         return True
 
-    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False):
+    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
@@ -563,6 +565,13 @@ class Analyzer:
         hits = self.index["by_func"].get(path, {})
         runtime = self.index["runtime"].get(path, 0)
         test_file = path.startswith("tests/")
+        # Another edit to a special method can alter the counterfactual operator
+        # even if the old operator never called it.
+        operand_safe = (operand_safe and not test_file and not scope_edit and old_funcs.keys() == new_funcs.keys()
+                        and all(old_funcs[q][1] == new_funcs[q][1] and
+                                (old_funcs[q][2] == new_funcs[q][2] or
+                                 not any(p.startswith("__") and p.split("#")[0].endswith("__")
+                                         for p in q.split("."))) for q in old_funcs))
         changed = False
         code = None
         equivalent = set()
@@ -614,6 +623,10 @@ class Analyzer:
                     for s_start, s_end in spans:
                         for ln in range(s_start, s_end + 1):
                             stmt_mask |= l_hits.get(ln, 0)
+                    if stmt_mask and operand_safe:
+                        stmt_mask = ((stmt_mask & self.index["heap_observers"]) |
+                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits,
+                                            lambda: pinned_layout(self.base, path) == frame_layout(compiled)))
                     out.direct |= stmt_mask
                 else:
                     out.direct |= hits.get(q, 0)

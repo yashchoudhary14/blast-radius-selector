@@ -11,6 +11,16 @@ These files describe the numbered tests at SQLGlot commit `eb11aec4be8cb2122afe7
 | `durations.json` | `{"test_number":[wall_seconds,process_cpu_seconds],...}`. Each pair measures the complete pytest protocol in a separate serial run. Wall time includes waiting for child processes. Process CPU measures the pytest process, including its threads. |
 | `query_cases.json.gz` | Each test ID maps to a fixture count, a table of integer case masks, and a per-file list of inclusive `[first_line, last_line, mask_index]` ranges. Bit zero is the first fixture. The parser limit test has one bit for its complete method. |
 
+`operands.zip` records comparison outcomes, operand bounds and simple boolean observations from the pinned tree. Tests with identical observations share a bitmap. The map covers two independent hash seeds and keeps any seed disagreement or unsupported operation as unknown. Regenerate it from the track directory with a fresh container name.
+
+```powershell
+docker run --name br-r-operands --network none --cpus 4 --memory 8g -e BR_OPERAND_BUILD=1 -e PYTHONPATH=/build:/sqlglot -e PYTHON_CPU_COUNT=2 -e OPENBLAS_NUM_THREADS=1 -v "${PWD}/entry-wt-r/selector/operand_build:/build:ro" -v "${PWD}/sample/sample:/data:ro" br-lab sh -ec 'PYTHONHASHSEED=17 python /build/collect.py /tmp/s17 && PYTHONHASHSEED=83 python /build/collect.py /tmp/s83 && python /build/pack.py /tmp/s17 /tmp/s83 /tmp/operands.zip'
+docker cp br-r-operands:/tmp/operands.zip entry-wt-r/maps/operands.zip
+docker rm br-r-operands
+```
+
+`parameters.zip` uses the same collection and packing steps with `-e BR_PARAMETER_BUILD=1` added to `docker run`. Copy the resulting archive to `maps/parameters.zip`. Each entry site describes None and truthiness observations for one parameter. The selector uses it for a leading return or raise guard whose predicate is always false in both runs.
+
 To regenerate the query map, run this from the track directory. Use an empty cache for a fresh collection. The builder runs each fixture separately, then traces the intact loop including pool workers. It assigns shared setup, teardown and unattributed full-run lines to every fixture.
 
 ```powershell
