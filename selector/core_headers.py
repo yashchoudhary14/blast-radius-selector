@@ -54,7 +54,7 @@ def inert_header(before, after, original_flags, updated_flags):
         for (_, a), (_, b) in zip(group, updated):
             if a is b or (a is not None and b is not None and ast.dump(a) == ast.dump(b)):
                 continue
-            if not all(isinstance(value, ast.Constant) and type(value.value) in (type(None), bool)
+            if not all(isinstance(value, ast.Constant) and type(value.value) in (type(None), bool, int, str)
                        for value in (a, b)):
                 return False
         return True

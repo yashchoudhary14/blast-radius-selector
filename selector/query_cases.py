@@ -11,8 +11,21 @@ from types import CodeType
 from runner.parser_cases import MAX_NODES
 from runner.query_cases import EXECUTOR
 
+from .query_bindings import bindings, reference_lines
+
 
 TPCDS = EXECUTOR + "test_execute_tpcds"
+
+
+def reached_cases(masks, files, path, intervals):
+    hit = 0
+    blocks = files.get(path, ())
+    for start, end in intervals:
+        i = bisect_left(blocks, start, key=lambda row: row[1])
+        while i < len(blocks) and blocks[i][0] <= end:
+            hit |= masks[blocks[i][2]]
+            i += 1
+    return hit
 
 
 def dead_condition(analyzer, edits, files):
@@ -90,6 +103,42 @@ class QueryCases:
         self.maps = {analyzer.num[node]: row for node, row in data.items() if node in analyzer.num}
         self._tpcds_weights = None
 
+    def binding_readers(self, path, edits, heavy):
+        analyzer = self.analyzer
+        original = analyzer.base / path
+        source = edits[path]
+        if not (source and original.is_file() and path.startswith(("sqlglot/", "tests/"))
+                and path.endswith(".py") and path != "sqlglot/__init__.py"):
+            return None
+        if path in edits.modes and edits.modes[path] != original.stat().st_mode & 0o777:
+            return None
+        result = bindings(original.read_bytes(), source, path)
+        if result is None:
+            return None
+        values, fresh = result
+        if any(not name.startswith("_") for name in fresh):
+            # A new name can also appear through a package's star re-export.
+            mod = path[:-3].replace("/", ".").removesuffix(".__init__")
+            if path.startswith("sqlglot/expressions/") or mod in analyzer._test_star_imports():
+                return None
+        observers = analyzer.location_observers(all_dynamic=True) | analyzer.state_refs.mask("__annotations__")
+        if path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/", "sqlglot/expressions/")):
+            # The corresponding lazy packages and serde can resolve names by string.
+            observers |= analyzer.state_refs.mask("*module")
+        readers = heavy & observers
+        for name in values | fresh:
+            for ref_path in analyzer.state_refs.refs.get(name, ()):
+                lines = reference_lines(analyzer, ref_path, name, name in values)
+                if not lines:
+                    continue
+                for number in self.maps:
+                    bit = 1 << number
+                    if heavy & bit and not readers & bit:
+                        _, masks, files = self.maps[number]
+                        if reached_cases(masks, files, ref_path, ((line, line) for line in lines)):
+                            readers |= bit
+        return readers
+
     def _get_tpcds_weights(self):
         if self._tpcds_weights is None:
             calibration = self.analyzer.maps / "tpcds-case-cpu.json"
@@ -117,7 +166,18 @@ class QueryCases:
         spans = {path: rows for path, rows in candidates.query_spans.items() if rows}
         opaque = {path for path, rows in candidates.query_spans.items() if rows is None}
         unresolved = opaque - candidates.query_guarded
-        if not spans:
+        blocked = candidates.query_blocked
+        proved_bindings = set()
+        heavy_mask = sum(1 << n for n in self.maps if analyzer.ids[n] in (TPCDS, MAX_NODES))
+        heavy = candidates.mask & heavy_mask & ~blocked
+        if heavy and not candidates.structural:
+            for path in sorted(unresolved):
+                readers = self.binding_readers(path, edits, heavy)
+                if readers is not None:
+                    blocked |= readers
+                    proved_bindings.add(path)
+            unresolved -= proved_bindings
+        if not spans and not proved_bindings:
             n = analyzer.num.get(MAX_NODES)
             if (n in self.maps and candidates.mask & (1 << n)
                     and not candidates.query_blocked & (1 << n)
@@ -125,7 +185,6 @@ class QueryCases:
                     and dead_condition(analyzer, edits, self.maps[n][2])):
                 return {n: []}
             return {}
-        blocked = candidates.query_blocked
         for path, intervals in spans.items():
             imports = analyzer.indirect_hits.get(path, {})
             for start, end in intervals:
@@ -139,8 +198,8 @@ class QueryCases:
             if any(analyzer.index["reads"].get(path, 0) & bit for path in edits):
                 continue
             count, masks, files = self.maps[number]
-            heavy = analyzer.ids[number] in (TPCDS, MAX_NODES)
-            if not heavy and (opaque or candidates.query_heavy_only):
+            is_heavy = bool(bit & heavy_mask)
+            if not is_heavy and (opaque or candidates.query_heavy_only):
                 continue
             if opaque and (candidates.structural or any(
                 path in files or (analyzer.importers[path] | analyzer.index["all_hits"].get(path, 0)) & bit
@@ -149,12 +208,7 @@ class QueryCases:
                 continue
             hit = 0
             for path, intervals in spans.items():
-                blocks = files.get(path, ())
-                for start, end in intervals:
-                    i = bisect_left(blocks, start, key=lambda row: row[1])
-                    while i < len(blocks) and blocks[i][0] <= end:
-                        hit |= masks[blocks[i][2]]
-                        i += 1
+                hit |= reached_cases(masks, files, path, intervals)
             if hit.bit_count() < count:
                 subsets[number] = [i for i in range(count) if hit & (1 << i)]
         return subsets

@@ -95,10 +95,13 @@ def pinned_branches(tree, path):
     return guards
 
 
-@lru_cache(maxsize=2)
-def pinned_projection(original, path):
+@lru_cache(maxsize=3)
+def pinned_projection(original, path, stress):
     tree = ast.parse(original)
-    return project(tree, path, pinned_branches(tree, path))
+    branches = pinned_branches(tree, path)
+    if not stress:
+        branches.pop("_match_text_seq", None)
+    return project(tree, path, branches)
 
 
 def equivalent_under_projection(before, projected, after):
@@ -132,12 +135,26 @@ def equivalent_under_projection(before, projected, after):
     return same_code(projected, after.replace(co_varnames=projected.co_varnames))
 
 
-def unchanged_stress_case(analyzer, edits, candidates, number):
-    # TestParser.test_max_nodes only passes built-in str SQL without comments
-    # to parse_one with the default dialect. Its tokens, comments and Table
-    # objects come from the unchanged SQLGlot constructors. The test never
-    # inspects a frame or passes in a user-supplied parser/tokenizer subclass.
+def unchanged_comment_case(analyzer, edits, candidates, number, *, stress):
+    # The stress test only parses comment-free SELECTs with the default
+    # dialect. The TPC-DS executor uses default parsing and DuckDB generation.
     from .analyze import _get_func_node
+    from .query_cases import reached_cases
+
+    if not stress:
+        if TOKENIZER in edits:
+            return False
+        # The case traces include imports, optimization and rendering. Both
+        # comment mutations must be dormant across these paths.
+        tree, _ = analyzer.old_tree_and_lines(PARSER)
+        _, masks, files = analyzer.queries.maps[number]
+        attach = _get_func_node(tree, "Parser._add_comments").body[0]
+        fast = _get_func_node(tree, "Parser._parse_table_parts_fast")
+        append = next(node for node in ast.walk(fast) if isinstance(node, ast.If)
+                      and is_expression(node.test, "has_dot and self._prev_comments"))
+        if reached_cases(masks, files, PARSER,
+                         [(branch.body[0].lineno, branch.end_lineno) for branch in (attach, append)]):
+            return False
 
     bit = 1 << number
     for path, source in edits.items():
@@ -172,7 +189,7 @@ def unchanged_stress_case(analyzer, edits, candidates, number):
                 reached.append(name)
         if not reached:
             continue
-        old_normal = pinned_projection(original, path)
+        old_normal = pinned_projection(original, path, stress)
         old_code = analyzer.old_code(path)
         new_code = functions(compile(source, path, "exec", dont_inherit=True))
         for name in reached:
