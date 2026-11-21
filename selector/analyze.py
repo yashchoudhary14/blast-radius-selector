@@ -25,6 +25,7 @@ from .core_headers import (inert_header, only_nested_definitions, private_consta
 from .dialect_cases import isolated_test_methods
 from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
+from .fixture_cases import unaffected_fixture_tests
 from .operands import narrow
 from .query_cases import MAX_NODES, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
@@ -1039,6 +1040,11 @@ class Analyzer:
                     out.direct &= ~omit
                     out.broad &= ~omit
                     out.priority &= ~omit
+        if not out.broken and not out.structural:
+            omit = unaffected_fixture_tests(self, edits)
+            out.direct &= ~omit
+            out.broad &= ~omit
+            out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
         stress = self.num.get(MAX_NODES)
         if (stress in self.queries.maps and stress not in out.query_subsets and not out.broken
