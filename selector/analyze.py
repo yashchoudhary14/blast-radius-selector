@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+import functools
 from functools import lru_cache
 from pathlib import Path
 
@@ -1229,11 +1230,23 @@ class Analyzer:
                     stars.add(_resolve_import_from(rel, node))
         return stars
 
-    def _unused_added_imports(self, path, old_tree, new_tree, rows):
+    @lru_cache(maxsize=1)
+    def _star_reexporters(self):
+        reexporters = defaultdict(set)
+        for file in sorted((self.base / "sqlglot").rglob("__init__.py")):
+            rel = file.relative_to(self.base).as_posix()
+            mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
+            tree, _ = self.old_tree_and_lines(rel)
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                    reexporters[_resolve_import_from(rel, node)].add((mod, rel))
+        return reexporters
+
+    def _unused_added_imports(self, path, old_tree, new_tree, rows=None):
         old_dumps = [ast.dump(s) for s in old_tree.body]
         new_dumps = [ast.dump(s) for s in new_tree.body]
         sm = SequenceMatcher(None, old_dumps, new_dumps, autojunk=False)
-        added_aliases = []  # (mod_name, bound_name)
+        added_aliases = []  # (mod_name, orig_name, bound_name)
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 continue
@@ -1241,13 +1254,13 @@ class Analyzer:
                 for stmt in new_tree.body[j1:j2]:
                     if isinstance(stmt, ast.Import):
                         for a in stmt.names:
-                            added_aliases.append((a.name, a.asname or a.name.partition(".")[0]))
+                            added_aliases.append((a.name, a.name, a.asname or a.name.partition(".")[0]))
                     elif isinstance(stmt, ast.ImportFrom):
                         if any(a.name == "*" for a in stmt.names) or stmt.module == "__future__":
                             return False
                         mod = _resolve_import_from(path, stmt)
                         for a in stmt.names:
-                            added_aliases.append((mod, a.asname or a.name))
+                            added_aliases.append((mod, a.name, a.asname or a.name))
                     else:
                         return False
             elif tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
@@ -1269,10 +1282,17 @@ class Analyzer:
                         return False
                     mod = None if isinstance(n_stmt, ast.Import) else _resolve_import_from(path, n_stmt)
                     for a in n_stmt.names[aj1:aj2]:
-                        added_aliases.append((a.name if mod is None else mod, a.asname or a.name.partition(".")[0] if mod is None else a.asname or a.name))
+                        if mod is None:
+                            added_aliases.append((a.name, a.name, a.asname or a.name.partition(".")[0]))
+                        else:
+                            added_aliases.append((mod, a.name, a.asname or a.name))
             else:
                 return False
         if not added_aliases:
+            return False
+        if rows is None and not all(
+            mod == "functools" and orig in vars(functools) for mod, orig, _ in added_aliases
+        ):
             return False
         old_imported = set()
         for stmt in old_tree.body:
@@ -1280,49 +1300,66 @@ class Analyzer:
                 old_imported.update(a.name for a in stmt.names)
             elif isinstance(stmt, ast.ImportFrom):
                 old_imported.add(_resolve_import_from(path, stmt))
-        for mod, _ in added_aliases:
+        for mod, _, _ in added_aliases:
             if mod == "__future__" or not (mod.partition(".")[0] in sys.stdlib_module_names or mod in old_imported):
                 return False
-        added_names = {name for _, name in added_aliases}
-        for node in ast.walk(old_tree):
-            if isinstance(node, ast.Name):
-                if node.id in added_names or node.id == "__all__":
-                    return False
-            elif isinstance(node, ast.alias):
-                bound = node.asname or node.name.partition(".")[0]
-                if bound in added_names or node.name in added_names:
-                    return False
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name in added_names or node.name == "__getattr__":
-                    return False
-            elif isinstance(node, ast.arg) and node.arg in added_names:
+        added_names = {name for _, _, name in added_aliases}
+
+        def module_unused(mod_path, mod_name, tree):
+            if mod_path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/")):
                 return False
-            elif isinstance(node, (ast.Global, ast.Nonlocal)) and added_names.intersection(node.names):
-                return False
-            elif isinstance(node, ast.Call):
-                fn = node.func
-                callee = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-                if callee in ("globals", "locals", "vars", "dir"):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    if node.id in added_names or node.id == "__all__":
+                        return False
+                elif isinstance(node, ast.alias):
+                    bound = node.asname or node.name.partition(".")[0]
+                    if bound in added_names or node.name in added_names:
+                        return False
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name in added_names or node.name == "__getattr__":
+                        return False
+                elif isinstance(node, ast.arg) and node.arg in added_names:
                     return False
+                elif isinstance(node, (ast.Global, ast.Nonlocal)) and added_names.intersection(node.names):
+                    return False
+                elif isinstance(node, ast.Call):
+                    fn = node.func
+                    callee = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+                    if callee in ("globals", "locals"):
+                        return False
+                    if callee in ("vars", "dir") and (
+                        not node.args or any("modules" in ast.dump(a) or "__name__" in ast.dump(a) for a in node.args)
+                    ):
+                        return False
+            if mod_name in self._test_star_imports():
+                return False
+            for attr in added_names:
+                if attr in self.state_refs.fields:
+                    return False
+                for ref_path in self.state_refs.refs.get(attr, ()):
+                    if ref_path == mod_path:
+                        continue
+                    ref_tree, _ = self.old_tree_and_lines(ref_path)
+                    for node in ast.walk(ref_tree):
+                        if isinstance(node, ast.ImportFrom) and any(a.name == attr for a in node.names):
+                            target = _resolve_import_from(ref_path, node)
+                            if target == mod_name or f"{target}.{attr}" == mod_name:
+                                return False
+            return True
+
         mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
-        if not all(r[0] == mod_name and r[1] in added_names for r in rows):
+        if not module_unused(path, mod_name, old_tree):
             return False
-        if mod_name in self._test_star_imports():
-            return False
-        for attr in added_names:
-            if attr in self.state_refs.fields:
+        reexporters = {rmod: rpath for rmod, rpath in self._star_reexporters().get(mod_name, ())}
+        for rmod, rpath in reexporters.items():
+            rtree, _ = self.old_tree_and_lines(rpath)
+            if not module_unused(rpath, rmod, rtree):
                 return False
-            for ref_path in self.state_refs.refs.get(attr, ()):
-                if ref_path == path:
-                    continue
-                ref_tree, _ = self.old_tree_and_lines(ref_path)
-                for node in ast.walk(ref_tree):
-                    if isinstance(node, ast.ImportFrom) and any(a.name == attr for a in node.names):
-                        target = _resolve_import_from(ref_path, node)
-                        if target == mod_name or f"{target}.{attr}" == mod_name:
-                            return False
-        if path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/")):
-            return False
+        if rows is not None:
+            allowed_mods = {mod_name, *reexporters}
+            if not all(r[0] in allowed_mods and r[1] in added_names for r in rows):
+                return False
         return True
 
     def _dict_value_candidates(self, path, old_tree, new_bytes, rows=None):
@@ -1983,6 +2020,11 @@ class Analyzer:
             return None, False
 
         refined = None
+        if dirty == {""} and scope_edit and not changed and not diagnostics and single_edit:
+            old_tree, _ = self.old_tree_and_lines(path)
+            if _same_directives_text_only(base_src, new) and self._unused_added_imports(path, old_tree, new_tree_for_stmts):
+                out.broad |= self.location_observers()
+                return
         if dirty and scope_edit and probe:
             reason, mark_broken = skip_reason()
             if reason is not None:

@@ -2,6 +2,7 @@
 import ast
 import dis
 import marshal
+import re
 import sys
 import types
 from collections import defaultdict
@@ -185,6 +186,58 @@ class StateRefs:
         return mask
 
 
+def _re_is_clean(tree):
+    if not any(
+        isinstance(s, ast.Import) and any(a.name == "re" and a.asname is None for a in s.names)
+        for s in tree.body
+    ):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "re" and not isinstance(node.ctx, ast.Load):
+            return False
+        if isinstance(node, ast.arg) and node.arg == "re":
+            return False
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "re":
+            return False
+    return True
+
+
+def _re_flags(node):
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+            and node.value.id == "re" and node.attr.isupper()):
+        val = getattr(re, node.attr, None)
+        if isinstance(val, (int, re.RegexFlag)):
+            return int(val)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left = _re_flags(node.left)
+        right = _re_flags(node.right)
+        if left is not None and right is not None:
+            return left | right
+    return None
+
+
+def _pure_re_compile(node):
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "re"
+            and node.func.attr == "compile" and not node.keywords and len(node.args) in (1, 2)):
+        return False
+    pat = node.args[0]
+    if not (isinstance(pat, ast.Constant) and type(pat.value) in (str, bytes)):
+        return False
+    flags = 0
+    if len(node.args) == 2:
+        flags = _re_flags(node.args[1])
+        if flags is None:
+            return False
+    try:
+        re.compile(pat.value, flags)
+    except re.error:
+        return False
+    return True
+
+
 def data_only(old, new, original, updated, touched, *, condition=False):
     """Prove all changed bytes belong to one data expression (or one unreached guard)."""
     def values(tree):
@@ -201,25 +254,37 @@ def data_only(old, new, original, updated, touched, *, condition=False):
         return (lines[:node.lineno-1] + [lines[node.lineno-1][:node.col_offset]],
                 [lines[node.end_lineno-1][node.end_col_offset:]] + lines[node.end_lineno:])
 
+    re_safe = _re_is_clean(old)
     for a, b in zip(values(old), values(new)):
         if not all(a.lineno <= n <= a.end_lineno for n in touched):
             continue
         if outside(original, a) != outside(updated, b):
             continue
-        if not condition and not _data_expression(a, b):
+        if not condition and not _data_expression(a, b, re_safe=re_safe):
             continue
         return True
     return False
 
 
-def _data_expression(left, right):
+def _data_expression(left, right, *, re_safe=False):
     # Accept plain literals, names and container displays. Existing calls or
     # deferred lambda bodies must be identical; they cannot introduce an
     # extra side effect solely because a neighbouring dictionary key changed.
     def opaque(node):
-        return sorted(ast.dump(n) for n in ast.walk(node) if isinstance(
-            n, (ast.Call, ast.NamedExpr, ast.Lambda, ast.ListComp, ast.DictComp,
-                ast.SetComp, ast.GeneratorExp, ast.BinOp, ast.Subscript)))
+        items = []
+        for n in ast.walk(node):
+            if not isinstance(
+                n, (ast.Call, ast.NamedExpr, ast.Lambda, ast.ListComp, ast.DictComp,
+                    ast.SetComp, ast.GeneratorExp, ast.BinOp, ast.Subscript)
+            ):
+                continue
+            if (isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr)
+                    and isinstance(n.left, ast.Dict) and isinstance(n.right, ast.Dict)):
+                continue
+            if re_safe and _pure_re_compile(n):
+                continue
+            items.append(ast.dump(n))
+        return sorted(items)
     return opaque(left) == opaque(right)
 
 

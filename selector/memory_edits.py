@@ -2,8 +2,8 @@
 
 import ast
 
-from .dialect_tables import concrete, same_directive_lines
-from .query_bindings import bindings, declaration
+from .dialect_tables import concrete, same_directive_lines, target
+from .query_bindings import bindings, declaration, reference_lines
 
 
 def scalar_kind(node):
@@ -49,6 +49,39 @@ def constants(old, new, path):
     return fields if fields and ast.dump(old) == ast.dump(revised) else set()
 
 
+_PARSER_TABLES = frozenset({"FUNCTIONS", "FUNCTION_PARSERS", "PROPERTY_PARSERS", "RANGE_PARSERS"})
+
+
+def _parser_table_lines(analyzer, path):
+    if not concrete(path, "parsers"):
+        return set()
+    tree, _ = analyzer.old_tree_and_lines(path)
+    lines = set()
+    for cls in tree.body:
+        if isinstance(cls, ast.ClassDef) and not cls.decorator_list and not cls.keywords:
+            for stmt in cls.body:
+                lhs = target(stmt)
+                if isinstance(lhs, ast.Name) and lhs.id in _PARSER_TABLES:
+                    lines.update(range(stmt.lineno, (stmt.end_lineno or stmt.lineno) + 1))
+    return lines
+
+
+def _field_hits_bit(analyzer, field, bit):
+    for reader_path in analyzer.state_refs.refs.get(field, ()):
+        lines = reference_lines(analyzer, reader_path, field, preserve_binding=True)
+        if not lines:
+            continue
+        direct = analyzer.line_hits(reader_path)
+        imports = analyzer.indirect_hits.get(reader_path, {})
+        parser_lines = _parser_table_lines(analyzer, reader_path)
+        for ln in lines:
+            if direct.get(ln, 0) & bit:
+                return True
+            if ln not in parser_lines and imports.get(ln, 0) & bit:
+                return True
+    return False
+
+
 def same_memory_workload(analyzer, edits, bit):
     if len(edits) != 1:
         return False
@@ -76,4 +109,6 @@ def same_memory_workload(analyzer, edits, bit):
     # values cannot change class construction, warmup or the measured loop
     # without a reader in one of those phases.
     return (not analyzer.location_observers(all_dynamic=True) & bit
-            and all(not analyzer.state_refs.mask(field) & bit for field in fields | {"*", "*module"}))
+            and not analyzer.state_refs.mask("*") & bit
+            and not analyzer.state_refs.mask("*module") & bit
+            and all(not _field_hits_bit(analyzer, field, bit) for field in fields))
