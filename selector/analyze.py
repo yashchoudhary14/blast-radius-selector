@@ -203,6 +203,9 @@ class Analyzer:
             masks.append(mask)
         self.indirect_hits = {path: {int(ln): masks[idx] for ln, idx in rows.items()}
                               for path, rows in imports["files"].items()}
+        # Lines executed only while their own module is imported (class/module bodies defining it).
+        self.import_self_only = {path: {int(ln) for ln, idx in rows.items() if imports["sets"][idx] == [path]}
+                                 for path, rows in imports["files"].items()}
         for cache in imports["caches"]:
             users = 0
             for path, ln in cache["reads"]:
@@ -364,8 +367,18 @@ class Analyzer:
             out.priority |= self.changed_line_hits(path, new)
         import_rows = self.indirect_hits.get(path)
         if import_rows and (scope_edit or changed):
-            for ln in _changed_old_lines((self.base / path).read_bytes(), new):
-                out.broad |= import_rows.get(ln, 0)
+            base_bytes = (self.base / path).read_bytes()
+            skip = set()
+            usage = self.index.get("class_usage", {})
+            if (dirty and "" not in dirty and usage and path.startswith("sqlglot/expressions/")
+                    and all(f"{path}::{o}" in usage for o in dirty)):
+                # Expression class-body data (arg_types, flags) executes only while its own module is
+                # imported; its effect reaches tests through the class, which the class-usage refinement
+                # below selects. Function bodies run at import time keep the importer attribution.
+                skip = self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
+            for ln in _changed_old_lines(base_bytes, new):
+                if ln not in skip:
+                    out.broad |= import_rows.get(ln, 0)
         if not dirty:
             return
         # A heap observer is a candidate if it executes the changed code (normal coverage rule),
@@ -455,6 +468,16 @@ class _MaskLambdas(ast.NodeTransformer):
 
     def visit_Lambda(self, node):
         return ast.copy_location(ast.Constant(value="<lambda>"), node)
+
+
+def _function_lines(src_bytes, name):
+    """Old-file line numbers inside any function or lambda (including its decorators/signature)."""
+    lines = set()
+    for node in ast.walk(ast.parse(src_bytes, name)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            lines.update(range(start, (node.end_lineno or node.lineno) + 1))
+    return lines
 
 
 def _changed_old_lines(old_bytes, new_bytes):
