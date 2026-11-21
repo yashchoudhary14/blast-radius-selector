@@ -27,6 +27,8 @@ try:
 except AttributeError:
     pass
 
+INTERPRETER_SETTINGS = {"setrecursionlimit", "set_int_max_str_digits"}
+
 
 def _get_func_node(tree, qname):
     curr = tree
@@ -223,6 +225,33 @@ def changes_frame_bindings(before, after):
             or not (old_locals - new_locals).isdisjoint(after.co_names))
 
 
+def interpreter_settings(source):
+    """Find writes to interpreter-wide settings that survive a test's execution."""
+    if not source or not any(name.encode() in source for name in INTERPRETER_SETTINGS):
+        return ()
+    try:
+        nodes = tuple(ast.walk(ast.parse(source)))
+    except (SyntaxError, ValueError):
+        return ()
+    modules, setters = set(), set()
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            modules.update(a.asname or a.name for a in node.names if a.name == "sys")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "sys":
+            setters.update(a.asname or a.name for a in node.names if a.name in INTERPRETER_SETTINGS)
+    return tuple(
+        ast.dump(node)
+        for node in nodes
+        if isinstance(node, ast.Call)
+        and (
+            isinstance(node.func, ast.Name) and node.func.id in setters
+            or isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name) and node.func.value.id in modules
+            and node.func.attr in INTERPRETER_SETTINGS
+        )
+    )
+
+
 class Analyzer:
     def __init__(self, manifest, base=Path("/sqlglot"), maps=Path("/app/maps")):
         self.base, self.maps = base, maps
@@ -317,6 +346,15 @@ class Analyzer:
                         grew = True
             self._expr_classes = expr
         return bool(owners) and all(o.split(".")[-1] in self._expr_classes for o in owners)
+
+    @lru_cache(maxsize=1)
+    def expression_keys(self):
+        masks = defaultdict(int)
+        for key, mask in self.index.get("class_usage", {}).items():
+            path, _, owner = key.partition("::")
+            if path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
+                masks[owner.rsplit(".", 1)[-1].lower()] |= mask
+        return masks
 
     @lru_cache(maxsize=32)
     def line_hits(self, path):
@@ -423,6 +461,14 @@ class Analyzer:
                 out.python_paths.append(path)
                 if not path.startswith("sqlglot/"):
                     out.dialect_subset_safe = False
+                if path.startswith(("sqlglot/", "tests/")):
+                    original = None if created else (self.base / path).read_bytes()
+                    if interpreter_settings(original) != interpreter_settings(new):
+                        # The full suite can observe writes from a module or test
+                        # that an isolated execution probe never loads or runs.
+                        out.broad |= self.all_tests
+                        out.broken = True
+                        continue
                 if p.name == "conftest.py" and (p.parent == Path(".") or p.parts[0] == "tests"):
                     # Even a nested conftest can change the entire item list.
                     out.broad |= self.all_tests
@@ -430,8 +476,7 @@ class Analyzer:
                     continue
                 if path.startswith("tests/") and (p.match("test_*.py") or p.match("*_test.py")
                                                   or self.importers[path]):
-                    before = None if created else (self.base / path).read_bytes()
-                    if collection_actions(before) != collection_actions(new):
+                    if collection_actions(original) != collection_actions(new):
                         # Shared changes during full-suite collection are invisible to
                         # probes that import only the test modules they execute.
                         out.broad |= self.all_tests
@@ -600,15 +645,24 @@ class Analyzer:
             # Parser.FUNCTIONS / Generator.TRANSFORMS dicts) are code, not data: a lambda body runs
             # at call time, so per-test line coverage of those lines names every caller.
             base_src = (self.base / path).read_bytes() if (self.base / path).is_file() else b""
-            _, old_masked = snapshot(_MaskLambdas().visit(ast.parse(base_src, path)), base_src)
-            _, new_masked = snapshot(_MaskLambdas().visit(ast.parse(new, path)), new)
+            old_lambdas, new_lambdas = _MaskLambdas(), _MaskLambdas()
+            _, old_masked = snapshot(old_lambdas.visit(ast.parse(base_src, path)), base_src)
+            _, new_masked = snapshot(new_lambdas.visit(ast.parse(new, path)), new)
             lambda_only = {q for q in dirty if q in old_masked and q in new_masked
                            and not scope_changed(old_masked[q], new_masked[q])}
             if lambda_only:
                 dirty -= lambda_only
                 l_hits = self.line_hits(path)
-                for ln in _changed_old_lines(base_src, new):
+                touched = _changed_old_lines(base_src, new)
+                for ln in touched:
                     out.direct |= l_hits.get(ln, 0)
+                if old_lambdas.frames != new_lambdas.frames:
+                    for start, end in old_lambdas.bodies:
+                        if any(start <= ln <= end for ln in touched):
+                            # A binding on one branch can invalidate a load
+                            # in another branch of the same callback.
+                            for ln in range(start, end + 1):
+                                out.direct |= l_hits.get(ln, 0)
         hits = self.index["by_func"].get(path, {})
         runtime = self.index["runtime"].get(path, 0)
         test_file = path.startswith("tests/")
@@ -650,6 +704,20 @@ class Analyzer:
                         continue
             changed = True
             owner, _, method = q.rpartition(".")
+            if bool(old) != bool(revised):
+                name = method.split("#")[0]
+                if owner in old_scopes and owner in new_scopes and name.startswith("__") and name.endswith("__"):
+                    # Python can alter an inherited protocol without calling a
+                    # same-named method on the baseline (e.g. implicit hashing).
+                    dirty.add(owner)
+                    out.dialect_subset_safe = False
+                elif not old and owner in new_scopes and not name.startswith("_") and name.endswith("_sql"):
+                    # Generator dispatch discovers methods by expression key;
+                    # the old implementation may have used the generic renderer.
+                    expr_mask = self.expression_keys().get(name[:-4], 0)
+                    if expr_mask and (path == "sqlglot/generator.py" or path.startswith(
+                            ("sqlglot/generators/", "sqlglot/dialects/"))):
+                        out.broad |= expr_mask | (self.index["heap_observers"] & self.importers[path])
             if old and revised and old[1] == revised[1]:
                 # Only function body changed: use statement-level granularity
                 old_tree, old_lines = self.old_tree_and_lines(path)
@@ -867,10 +935,19 @@ def check_dataset(args, analyzer, answers, state_session):
 
 
 class _MaskLambdas(ast.NodeTransformer):
-    """Replace every lambda with a constant so scope signatures ignore lambda-internal edits."""
+    """Mask deferred bodies while keeping the definition-time defaults."""
+
+    def __init__(self):
+        self.bodies = []
+        self.frames = []
 
     def visit_Lambda(self, node):
-        return ast.copy_location(ast.Constant(value="<lambda>"), node)
+        self.bodies.append((node.lineno, node.end_lineno))
+        bindings = frozenset(n.target.id for n in ast.walk(node.body) if isinstance(n, ast.NamedExpr))
+        generator = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node.body))
+        self.frames.append((bindings, generator))
+        node.body = ast.copy_location(ast.Constant(value="<lambda>"), node.body)
+        return self.generic_visit(node)
 
 
 def _function_lines(src_bytes, name):
