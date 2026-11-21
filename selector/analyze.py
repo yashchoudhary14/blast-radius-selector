@@ -18,7 +18,7 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
-from .comment_cases import unchanged_stress_case
+from .comment_cases import unchanged_comment_case
 from .config_edits import added_methods, configuration_changes
 from .core_headers import (inert_header, only_nested_definitions, private_constants,
                            retired_dialect_bindings, schema_methods, shared_core)
@@ -26,7 +26,7 @@ from .dialect_cases import isolated_test_methods
 from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
 from .operands import narrow
-from .query_cases import MAX_NODES, QueryCases, body_spans, frame_layout, pinned_layout
+from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
@@ -1040,13 +1040,14 @@ class Analyzer:
                     out.broad &= ~omit
                     out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
-        stress = self.num.get(MAX_NODES)
-        if (stress in self.queries.maps and stress not in out.query_subsets and not out.broken
-                and out.mask & ~out.query_blocked & (1 << stress)
-                and production_count
-                and edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}
-                and unchanged_stress_case(self, edits, out, stress)):
-            out.query_subsets[stress] = []
+        if (not out.broken and production_count and
+                edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}):
+            for test in (MAX_NODES, TPCDS):
+                number = self.num.get(test)
+                if (number in self.queries.maps and out.query_subsets.get(number) != []
+                        and out.mask & ~out.query_blocked & (1 << number)
+                        and unchanged_comment_case(self, edits, out, number, stress=test == MAX_NODES)):
+                    out.query_subsets[number] = []
         return out
 
     @lru_cache(maxsize=1)
@@ -1446,7 +1447,7 @@ class Analyzer:
                     out.broad |= (self.location_observers() | self.state_refs.mask("*module")
                                   | self.state_refs.mask("__annotations__"))
                     out.broad |= self.index["heap_observers"] & self.importers[path]
-                    out.query_spans = None
+                    out.query_spans[path] = None
                     out.dialect_subset_safe = False
                     return
         dialect_code = (path in {"sqlglot/parser.py", "sqlglot/generator.py"}
