@@ -1,10 +1,9 @@
 """Compare measured runner CPU with the marginal cost of the emitted worker schedule."""
 
-import resource
 import time
 from collections import defaultdict
 
-from runner import GENERATOR_MEMORY
+from runner import GENERATOR_MEMORY, cpu_time
 from .analyze import numbers
 from .dialect_cases import DialectCases
 from .patch_proof import PatchProof
@@ -12,25 +11,19 @@ from .proxies import can_prove_pass
 from .workers import schedule
 
 
-# Two busy lanes under the scorer quota. Fit the per-module charge on ordinary batches, then
-# regress child CPU on recorded seconds and fixture presence across all batch sizes.
-STARTUP = 0.084
+# Shared fork and unittest fixture costs for a batch of warm test methods.
+STARTUP = 0.015
 PER_SECOND = 1.001
-PER_MODULE = 0.0132
-FIXTURE = {"tests/test_executor.py": 1.173, "tests/test_optimizer.py": 0.534}
+PER_MODULE = 0.002
+FIXTURE = {"tests/test_executor.py": 1.173, "tests/test_optimizer.py": 0.095}
 # Pristine single-test child CPU under the same limits, inclusive of collection.
 SINGLE = {
-    773: .655, 1082: 1.645, 1106: 33.073, 1107: 2.367, 1123: 5.487,
-    1224: 2.198, 1295: 1.895, 1313: 1.069, 1343: 2.041, 1358: .890,
-    1361: 1.762, 1382: 3.069, 1415: 1.100, 1428: 2.271, 1434: 1.937,
-    1440: 6.215, 1490: 29.103, 1541: .301, 1560: 1.024, 1561: .442,
+    773: .675, 1082: 1.711, 1106: 39.413, 1107: 2.308, 1123: 5.635,
+    1224: 3.034, 1295: 1.843, 1313: .878, 1343: 2.065, 1358: .959,
+    1361: 1.653, 1382: 3.177, 1415: 1.115, 1428: 3.091, 1434: 2.363,
+    1440: 8.075, 1490: 33.594, 1541: .459, 1560: 1.004, 1561: .600,
 }
 PROOF_CPU = {1082: .3, 1106: 4.5, 1107: .4, 1123: .5, 1361: 1.4}
-
-
-def cpu_time():
-    children = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return time.process_time() + children.ru_utime + children.ru_stime
 
 
 class Execution:
@@ -41,16 +34,23 @@ class Execution:
         self.memory = self.num.get(GENERATOR_MEMORY)
         self.dialects = DialectCases(analyzer.maps)
         self.files = {t["number"]: t["file"] for t in tests}
+        self.pool_tests = set(numbers(analyzer.index["by_func"].get("tests/test_optimizer.py", {}).get(
+            "TestOptimizer.check_file", 0)))
+        self.import_cpu = 0.
         self.body = {n: PER_SECOND * ms / 1000 for n, ms in millis.items()}
         for n, total in SINGLE.items():
             if n in self.body:
-                self.body[n] = max(0, total - self.setup({self.files[n]}))
+                self.body[n] = max(0, total - self.setup({n}))
 
-    def setup(self, files):
-        return STARTUP + PER_MODULE * len(files) + sum(FIXTURE.get(f, 0) for f in files)
+    def setup(self, batch):
+        files = {self.files[n] for n in batch}
+        # The optimizer spawns a fresh Python worker on its first submitted
+        # fixture pair. Other optimizer methods only pay for the DuckDB setup.
+        pool = .65 if self.pool_tests.intersection(batch) else 0.
+        return STARTUP + PER_MODULE * len(files) + sum(FIXTURE.get(f, 0) for f in files) + pool
 
     def run_cost(self, batch):
-        return self.setup({self.files[n] for n in batch}) + sum(self.body[n] for n in batch)
+        return self.import_cpu + self.setup(batch) + sum(self.body[n] for n in batch)
 
     def cost(self, selected):
         return schedule(selected, self.millis)[1] / 1000
@@ -88,9 +88,15 @@ class Execution:
 
         if get_session is None:
             return conservative(selected)
+        if len(selected) == 1 and not candidates.python_paths:
+            # A single direct data reader can save only its own worker on a pass.
+            # Keep the reader when its expected edit is the sole evidence.
+            return selected
+        stage = get_session().import_stage(candidates.python_paths)
+        self.import_cpu = {2: 0., 1: .025, 0: .065, -1: .15}[stage]
         subset = self.dialects.subset(candidates) if self.memory is not None else None
         if subset is not None:
-            subset_cost = self.setup({self.files[self.memory]}) + .2 * len(subset)
+            subset_cost = self.import_cpu + self.setup({self.memory}) + .12 * len(subset)
         memory_passed = False
 
         def include_importers():
@@ -128,7 +134,9 @@ class Execution:
             observed.add(self.memory)
 
         if subset is not None and self.memory in selected:
-            probe_memory()
+            kept = conservative(selected)
+            if .5 * (self.cost(kept) - self.cost(kept - {self.memory})) > subset_cost:
+                probe_memory()
         proof = root = None
         tried_replay = set()
 
@@ -172,7 +180,6 @@ class Execution:
                 log(f"proof {commit} n={n} passed={int(bool(reason))} reason={reason or 'no-witness'} "
                     f"cpu={cpu_time()-start:.6f}")
 
-        probed = False
         while time.monotonic() < deadline:
             pending = selected - observed - protected
             if not pending:
@@ -224,18 +231,10 @@ class Execution:
                     selected.remove(n)
                 continue
 
-            cheap = {n for n in pending if self.millis[n] < 500}
             if best is None:
-                if probed or not cheap or not candidates.python_paths:
-                    break
-                # Resolve import failures even when an indivisible heavy test
-                # pins the price. A broad import error changes the candidate set.
-                best = {min(cheap, key=rank)}
-                if self.run_cost(best) > budget:
-                    break
+                break
             log(f"decision {commit} batch={len(best)}/{len(pending)} est={self.run_cost(best):.3f} "
                 f"gain={static-self.cost(conservative(selected-best)):.3f} early={int(not failed)} budget={budget:.2f}")
-            probed = True
             root = None  # Session.run removes its overlay.
             if not run(best, not failed):
                 break

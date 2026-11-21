@@ -15,7 +15,7 @@ from pathlib import Path
 from .cases import GENERATOR_MEMORY, execute
 from .overlay import PatchError, changes, populate
 from .process import child_pipe
-from .warm import preload, project_modules
+from .warm import WarmParents, project_modules
 
 
 @dataclass
@@ -32,6 +32,11 @@ def _usage():
     return usage.ru_utime + usage.ru_stime
 
 
+def cpu_time():
+    # wait4 only charges a snapshot's children to the lane when it exits.
+    return time.process_time() + _usage() + sum(parent.cpu for parent in WarmParents.live)
+
+
 def _enter_tree(root, base, warmed):
     os.chdir(root)
     sys.path[:] = [str(root)] + [
@@ -41,10 +46,9 @@ def _enter_tree(root, base, warmed):
     os.environ["SKIP_INTEGRATION"] = "0"
     sys.dont_write_bytecode = True
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    for name in project_modules():
-        del sys.modules[name]
-    if warmed:
-        sys.modules.update(warmed)
+    if not warmed:
+        for name in project_modules():
+            del sys.modules[name]
     importlib.invalidate_caches()
 
     # Docker's CPU quota does not constrain sched_getaffinity(). Python
@@ -133,6 +137,14 @@ def _collect(fd, ids, deadline):
     return result
 
 
+def _fork_run(root, base, ids, deadlines, early, deadline, case_filter, *, warm):
+    start = _usage()
+    with child_pipe(_child, root, base, ids, deadlines, early, warm, case_filter) as rd:
+        result = _collect(rd, ids, deadline)
+    result.cpu_s = _usage() - start
+    return result
+
+
 class Session:
     def __init__(self, base="/sqlglot", tmp="/tmp/br", *, warm_fixtures=True):
         self.base = Path(base).resolve()
@@ -147,7 +159,26 @@ class Session:
         if catalog.is_file():
             self.seconds = {t["id"]: t["seconds"] for t in json.loads(catalog.read_bytes())["tests"]}
 
+    def warm(self):
+        if self.warm_fixtures and self._warm is None and self.base == Path("/sqlglot"):
+            self._clear()
+            populate(self.base, self._root, {})
+            try:
+                self._warm = WarmParents(self._root, self.base, self.seconds, _enter_tree, _fork_run)
+            except (OSError, EOFError) as exc:
+                print(f"runner preload failed: {exc!r}", file=sys.stderr)
+                self.warm_fixtures = False
+            finally:
+                self._clear()
+        return self._warm.preload_cpu if self._warm else 0.
+
+    def import_stage(self, paths):
+        return self._warm.stage(paths) if self._warm else -1
+
     def close(self):
+        if self._warm:
+            self._warm.close()
+            self._warm = None
         self._temp.cleanup()
 
     def __enter__(self):
@@ -180,24 +211,26 @@ class Session:
                 raise ValueError("case filters require a selected generator-memory test")
             if not ids:
                 return RunResult()
-            warm = self.warm_fixtures and self.base == Path("/sqlglot") and edits and all(
-                p.startswith("tests/fixtures/") and p.endswith((".sql", ".json", ".gz"))
-                for p in edits
-            )
-            if warm and self._warm is None:
-                populate(self.base, self._root, {})
-                self._warm = preload(self._root)
-                self._clear()
+            self.warm()
+            parent = self._warm.choose(edits, self.base, ids, patch_text) if self._warm else None
             populate(self.base, self._root, edits)
             budgets = per_test_budget or {}
             deadlines = [max(1.0, timeout_factor * budgets.get(i, self.seconds.get(i, 0))) for i in ids]
             guard = overall_timeout if overall_timeout is not None else 15 + sum(deadlines)
             deadline = time.monotonic() + guard
-            start = _usage()
-            with child_pipe(_child, self._root, self.base, ids, deadlines, stop_on_first_fail,
-                            self._warm if warm else None, case_filter) as rd:
-                result = _collect(rd, ids, deadline)
-            result.cpu_s = _usage() - start
-            return result
+            request = (ids, deadlines, stop_on_first_fail, deadline, case_filter)
+            if parent is not None:
+                try:
+                    parent.send(request)
+                    result = parent.recv()
+                except (EOFError, OSError) as exc:
+                    print(f"runner snapshot unavailable: {exc!r}", file=sys.stderr)
+                    self._warm.close()
+                    self._warm = None
+                    self.warm_fixtures = False
+                else:
+                    self._warm.cpu += result.cpu_s
+                    return result
+            return _fork_run(self._root, self.base, *request, warm=False)
         finally:
             self._clear()

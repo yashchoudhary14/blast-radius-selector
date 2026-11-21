@@ -221,6 +221,18 @@ class RunnerTest(unittest.TestCase):
             self.assertFalse(session.run(fixture.replace("select 1", "SELECT 1"), ids).failing)
         self.assertIs(sys.modules.get("sqlglot"), original)
 
+    @unittest.skipUnless(Path("/sqlglot/sqlglot/dialects/dremio.py").is_file(), "needs pinned base")
+    def test_dialect_registration_rollback(self):
+        path = "sqlglot/dialects/dremio.py"
+        patch = f"--- a/{path}\n+++ b/{path}\n@@ -1,0 +2 @@\n+raise RuntimeError('changed dialect')\n"
+        nodes = ["tests/dialects/test_dremio.py::TestDremio::test_type_mappings"]
+        with Session() as session:
+            self.assertGreater(session.warm(), 0.)
+            self.assertGreaterEqual(session.import_stage([path]), 0)
+            for diff, expected in [("", set()), (patch, set(nodes)), ("", set())]:
+                result = session.run(diff, nodes)
+                self.assertEqual((result.ran, result.failing), (nodes, expected))
+
     def test_deadlines(self):
         self.put("tests/cases.py", """
             import unittest, time

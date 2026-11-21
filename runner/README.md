@@ -13,7 +13,7 @@ with Session(base="/sqlglot", tmp="/tmp/br") as session:
                          stop_on_first_fail=False, overall_timeout=30)
 ```
 
-Read patch files with `path.read_bytes().decode("utf-8", "surrogateescape")` to preserve literal carriage returns in hunk lines. The default session constructor loads catalog timings and the unittest machinery. Project imports start in the first child, or during the first fixture-only preload.
+Read patch files with `path.read_bytes().decode("utf-8", "surrogateescape")` to preserve literal carriage returns in hunk lines. The default session constructor loads catalog timings and the unittest machinery. The selector calls `session.warm()` at lane startup. A standalone session initializes its warm parents on its first run.
 
 - `test_ids` contains strings such as `tests/test_parser.py::TestParser::test_ref_type`. The runner groups selections by module and class in first-seen order. Each selected method runs once.
 - `case_filter={GENERATOR_MEMORY: ["BIGQUERY", "DREMIO"]}` runs the named enum members in their original order. Import `GENERATOR_MEMORY` from `runner`. The child restores the original enum before teardown. A failed subtest marks the method as failed.
@@ -26,7 +26,21 @@ Read patch files with `path.read_bytes().decode("utf-8", "surrogateescape")` to 
 
 The overlay symlinks untouched entries to the base checkout. A directory containing changed Python files exposes only the unaffected bytecode caches. The runner also gives the pinned test that resolves its own source path a local inode when the sibling `sqlglotc` package changes. Python subprocesses inherit the overlay import path. Each test child uses at most two available CPUs so process pools respect the container quota.
 
-For data-only changes under `/sqlglot/tests/fixtures` (`.sql`, `.json`, `.gz`), the session lazily imports pristine sqlglot, the test helpers and the parser test module through a stable overlay path. Only the test children receive the saved module objects. The parent restores the caller's module table. Python changes always use fresh project imports. `Session(warm_fixtures=False)` selects the cold reference path.
+### Warm imports and invalidation
+
+Each lane imports the pristine tree through its stable overlay path. Linux fork preserves four points in that import sequence: core SQLGlot, executor/optimizer and dialect test helpers, all importable SQLGlot modules and ordinary test modules, and finally the plugin-discovery test. Importing that last test registers a synthetic dialect. Only probes consisting entirely of that file may use its snapshot. The CLI entry module executes on import and stays child-local. Native dependencies are shared across lanes. Database connections, test bodies and unittest setup run in the test child.
+
+The build independently imports each production module in a fresh interpreter, then combines the resulting file sets with the pinned test collection imports and file reads. For each patch the runner takes the reverse transitive closure from its changed paths. It chooses the latest fork snapshot disjoint from that closure. Moving back a snapshot discards the affected modules together with every later registry write, lazy package alias, parser/generator class, transform table, trie and cache entry. Earlier snapshots never executed the affected module. The child changes into the patched overlay and resolves its missing imports there. A data-only fixture patch retains production modules and reads fixture contents during test execution.
+
+Core edits that intersect every snapshot, changed test code, and changes with uncertain package discovery use the cold lane. `Session(warm_fixtures=False)` always selects this reference. Nested interpreters created by tests still use the overlay via `PYTHONPATH`.
+
+From the track directory, run the candidate-or-failing-plus-random-passing comparison with
+
+```powershell
+& 'C:\dev\Buildathon\.venv\Scripts\python.exe' -B entry-wt-o/runner/check_warm.py --image br-o --jobs 6
+```
+
+It checks all labeled commits, reuses identical patch content across sets and writes per-commit outcomes and CPU to `scratch/o-warm/gate`. The benchmark accepts `--singles` in the selector image to measure the heavy catalog methods used by its cost model.
 
 ## Reproduction
 
@@ -40,7 +54,7 @@ This builds `br-runner`, runs the regression tests and import benchmark, and che
 
 While corpus labels are being generated, `entry/runner/corpus.py --jobs 5` records the full failing sets and child timings in `scratch/runner/corpus/c1`. Rerun with `--compare-only` after `answers.json` appears. The cache checks the patch digest, runner source and numbered catalog before reusing an observation. An incomplete child run fails verification even if every requested ID appears in its partial result.
 
-## Import measurements
+## Historical import measurements
 
 The benchmark collects one parser test and omits its body. The first-call column includes parent staging and any one-time preload. The other columns give the median of the next seven calls in seconds.
 
@@ -53,14 +67,14 @@ The benchmark collects one parser test and omits its body. The first-call column
 
 The 50-test benchmark samples the catalog with `random.Random(42)` and restores catalog order. Its recorded duration is 0.720 s. The full catalog has 1,620 tests and 103.047 recorded seconds.
 
-## Sample exactness and cost
+## Historical sample exactness and cost
 
 All 30 full failing sets matched the organizers' answers. The runner attempted all 48,600 methods and identified all 73 labeled failures with zero false positives. All 30 subset runs also matched, totaling 1,500 decisions. The nine regression tests cover patch application, stale bytecode, spawned interpreters, fixture and subtest failures, unexpected success, skips, deadlines, early exit and switching between cached fixture and fresh code imports.
 
 | Selection per commit | Mean child CPU | Median child CPU | Child CPU / recorded seconds | Mean parent CPU |
 | --- | ---: | ---: | ---: | ---: |
-| 1,620 tests | 143.493 s | 142.952 s | 1.393× | 0.156 s |
-| 50 tests | 3.184 s | 3.034 s | 4.422× | 0.024 s |
+| 1,620 tests | 143.493 s | 142.952 s | 1.393Ã— | 0.156 s |
+| 50 tests | 3.184 s | 3.034 s | 4.422Ã— | 0.024 s |
 
 The local Docker Desktop host also ran other lab jobs during the measurement. Each cell below is child CPU seconds for a single commit.
 

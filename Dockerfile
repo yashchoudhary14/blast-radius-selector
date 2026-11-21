@@ -37,7 +37,7 @@ if not directory_reads.exists():
     directories = [base, *(p for p in base.rglob("*") if p.is_dir())]
     directory_reads.write_text(json.dumps({p.relative_to(base).as_posix(): numbers for p in directories}))
 PY
-RUN python -m selector.collect && python -m selector.build_maps && \
+RUN python -m selector.collect && python -m runner.dependencies && python -m selector.build_maps && \
     python -m compileall -q /app && chmod -R a+rX /sqlglot /app
 ENV SELECTOR_STATIC=1
 CMD ["python", "-m", "selector.main"]
