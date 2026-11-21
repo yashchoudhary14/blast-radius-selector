@@ -19,8 +19,8 @@ from .collect import BASE, MAPS
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
-from .source_equivalence import (compile_source, dead_statement, doc_class_safe, docstring_only,
-                                 line_insertion, relocated_code, same_code, same_directives, signature_metadata)
+from .source_equivalence import (compile_source, dead_statement, docstring_only, line_insertion, relocated_code,
+                                 same_code, same_directives, signature_metadata)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -430,13 +430,12 @@ class Analyzer:
         # The pinned "*module" sites are lazy-export tables (which never
         # forward __doc__) and serde's immediately invoked attribute (where
         # both doc values are non-callable strings).
-        # EXTRACT reflects on SQL values. The pinned test data contains no
-        # module or class objects as values in the Python executor.
         for name in ("getdoc", "getsource", "getsourcelines", "DocTestSuite", "doctest",
-                     "pydoc", "help", "*", "co_positions", "__code__"):
+                     "pydoc", "help", "*", "*sqlvalue", "co_positions", "__code__"):
             mask |= self.state_refs.mask(name)
         for path, lines in self.state_refs.refs.get("__doc__", {}).items():
-            # The pinned hook only copies a subclass's own nonempty string.
+            # This pinned hook reads only the doc of an Expr subclass under
+            # construction. Plain top-level classes and modules can't be cls.
             hook = None
             if path == "sqlglot/expressions/core.py":
                 hook = _get_func_node(self.old_tree_and_lines(path)[0], "Expr.__init_subclass__")
@@ -451,18 +450,10 @@ class Analyzer:
     def signature_observers(self):
         mask = 0
         for name in ("__annotations__", "__defaults__", "__kwdefaults__", "get_type_hints",
-                     "get_annotations", "getargspec", "getfullargspec", "getsource",
-                     "getsourcelines", "co_positions", "__code__", "pydoc", "help", "*",
+                     "get_annotations", "signature", "getargspec", "getfullargspec", "getsource",
+                     "getsourcelines", "co_positions", "__code__", "pydoc", "help", "*", "*sqlvalue",
                      "exec", "eval", "locals", "f_locals", "currentframe", "_getframe", "getouterframes"):
             mask |= self.state_refs.mask(name)
-        for path, lines in self.state_refs.refs.get("signature", {}).items():
-            for line in lines:
-                if path == "sqlglot/executor/env.py" and b"param in enumerate(inspect.signature(func).parameters)" in (
-                    self.old_tree_and_lines(path)[1][line - 1]
-                ):
-                    # null_if_any inspects parameter names, not annotations or defaults.
-                    continue
-                mask |= self.line_hits(path).get(line, 0) | self.indirect_hits.get(path, {}).get(line, 0)
         return mask
 
     @lru_cache(maxsize=1)
@@ -485,19 +476,19 @@ class Analyzer:
         if diagnostics:
             return None
         if insertion:
-            old_tree, _ = self.old_tree_and_lines(path)
-            if (relocated_code(before, compiled, insertion) or dead_statement(old_tree, new_tree, insertion)):
+            if relocated_code(before, compiled, insertion):
                 if same_directives(old, new, insertion):
+                    return self.location_observers()
+            elif frame_layout(before) == frame_layout(compiled):
+                old_tree, _ = self.old_tree_and_lines(path)
+                if dead_statement(old_tree, new_tree, insertion) and same_directives(old, new, insertion):
                     return self.location_observers()
         if not (scope_edits or headers):
             return None
         if same_code(before, compiled) and same_directives(old, new):
             return 0  # Independent source readers were already selected.
         old_tree, _ = self.old_tree_and_lines(path)
-        doc = docstring_only(old, new, old_tree, new_tree)
-        if (doc is not None and (doc is old_tree or doc_class_safe(
-                doc, old_tree, path, lambda p: self.old_tree_and_lines(p)[0]))
-                and same_directives(old, new)):
+        if docstring_only(old, new, old_tree, new_tree, before, compiled):
             return self.doc_observers()
         if len(headers) == 1:
             q = headers[0]
