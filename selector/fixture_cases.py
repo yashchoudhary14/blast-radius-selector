@@ -32,6 +32,12 @@ def pairs(source):
     return rows
 
 
+def executor_inputs(rows):
+    # The parent parses every SQL string. The worker only uses the truthiness
+    # of the execute option, and the assertion never reads the expected SQL.
+    return [(sql, bool(dict(meta).get("execute"))) for meta, sql, _ in rows]
+
+
 def unaffected_fixture_tests(analyzer, edits):
     if len(edits) != 1:
         return 0
@@ -51,11 +57,13 @@ def unaffected_fixture_tests(analyzer, edits):
 
     safe = set()
     if path in {TPC_H, TPC_DS}:
-        # Both fixtures are loaded into separate class attributes. Aggregation
-        # order uses neither. The two TPC-H methods only consume tpch_sqls.
+        # Shared setup loads both fixtures into separate class attributes.
+        # Each benchmark consumes only its own family after setup succeeds.
         safe.add(EXECUTOR + "test_agg_order")
-        if path == TPC_DS or [r[:2] for r in before] == [r[:2] for r in after]:
-            # _mp_execute submits metadata and input SQL, never expected SQL.
+        same_inputs = executor_inputs(before) == executor_inputs(after)
+        if path == TPC_H or same_inputs:
+            safe.add(EXECUTOR + "test_execute_tpcds")
+        if path == TPC_DS or same_inputs:
             safe.add(EXECUTOR + "test_execute_tpch")
         if path == TPC_DS or [r[1:] for r in before] == [r[1:] for r in after]:
             safe.add(EXECUTOR + "test_optimized_tpch")
