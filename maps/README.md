@@ -10,6 +10,11 @@ These files describe the numbered tests at SQLGlot commit `eb11aec4be8cb2122afe7
 | `reads.json.gz` | `{"path":[test_number,...],...}`. Each sorted list identifies tests that opened an existing file under the checkout with read access, including Python sources opened as data. |
 | `durations.json` | `{"test_number":[wall_seconds,process_cpu_seconds],...}`. Each pair measures the complete pytest protocol in a separate serial run. Wall time includes waiting for child processes. Process CPU measures the pytest process, including its threads. |
 | `query_cases.json.gz` | Each test ID maps to a fixture count, a table of integer case masks, and a per-file list of inclusive `[first_line, last_line, mask_index]` ranges. Bit zero is the first fixture. The parser limit test has one bit for its complete method. |
+| `dialect-reads.json.gz` | Each test node ID or test file maps dispatch fields to the keys observed while running the pristine tests, including unsuccessful lookup attempts. A missing field or record provides no evidence. File records combine the reads of all methods in that file. |
+
+To regenerate the dispatch map in the pinned environment, run
+`python -m selector.dialect_reads.build /sqlglot /data/tests.json /app/maps/dialect-reads.json.gz --all-files`.
+The collector runs the expensive methods separately and traces the methods in each complete test file. It merges observations from spawned Python interpreters and requires a passing, complete test run before recording any result.
 
 `operands.zip` records comparison outcomes, operand bounds and simple boolean observations from the pinned tree. Tests with identical observations share a bitmap. The map covers two independent hash seeds and keeps any seed disagreement or unsupported operation as unknown. Regenerate it from the track directory with a fresh container name.
 

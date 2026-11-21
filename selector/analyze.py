@@ -19,6 +19,8 @@ from runner.overlay import changes
 from .collect import BASE, MAPS
 from .config_edits import added_methods, configuration_changes
 from .dialect_cases import isolated_test_methods
+from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
+from .dialect_time import time_changes, time_readers
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
@@ -318,6 +320,7 @@ class Analyzer:
         self.tests = json.loads(manifest.read_bytes())["tests"]
         self.ids = {t["number"]: t["id"] for t in self.tests}
         self.num = {i: n for n, i in self.ids.items()}
+        self.dialect_reads = DialectTableReads(self)
         self.queries = QueryCases(self)
         self.file_tests, self.class_tests, self.methods = (defaultdict(int) for _ in range(3))
         metadata = self.index["dialect_mentions"]
@@ -784,6 +787,16 @@ class Analyzer:
         isolated_tests = self.isolated_test_edits(edits)
         # Only verified test-method edits can accompany a single production edit.
         production_count = len(edits) - len(isolated_tests)
+        def concrete_edit(path, data):
+            old = self.base / path
+            if data is None or not any(concrete(path, kind) for kind in ("parsers", "generators", "dialects", "typing")):
+                return False
+            if not old.is_file():
+                return False
+            mode = old.stat().st_mode & 0o777
+            return edits.modes.get(path, mode) == mode
+
+        concrete_edits = all(p in isolated_tests or concrete_edit(p, data) for p, data in edits.items())
         registrations = self.expression_additions(edits)
         new_classes = {name for additions in registrations.values() for name, _ in additions.values()}
         for directory in edits.removed_dirs:
@@ -920,11 +933,41 @@ class Analyzer:
                 if path.startswith("sqlglot/typing/") and new is not None:
                     mask = self.typing_readers(path, new, new_classes)
                     if mask is not None:
+                        if concrete_edits and concrete(path, "typing"):
+                            original = (self.base / path).read_bytes()
+                            if same_directive_lines(original, new):
+                                names, _ = changed_metadata(ast.parse(original), ast.parse(new))
+                                omit = self.dialect_reads.unrelated({"EXPRESSION_METADATA": names})
+                                mask &= ~(omit & ~self.index["heap_observers"])
                         out.broad |= mask
                         out.query_spans = None
                         continue
+                prior, subset_safe = out.mask, out.dialect_subset_safe
                 self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
                             operand_safe=production_count == 1)
+                if concrete_edits and not out.broken and new is not None:
+                    unaffected = 0
+                    if concrete(path, "dialects"):
+                        original = (self.base / path).read_bytes()
+                        strict_changed = time_changes(path, original, new)
+                        if strict_changed is not None:
+                            unaffected = ~time_readers(self, strict_changed)
+                    elif self.dialect_reads.records and (concrete(path, "parsers") or concrete(path, "generators")):
+                        original = (self.base / path).read_bytes()
+                        tables = table_changes(path, original, new, self.dialect_reads.known_expression,
+                                               self.dialect_reads.transform_callbacks(), self.dialect_reads.known_tokens())
+                        keep = 0
+                        if not tables:
+                            tables, keep = self.dialect_reads.generator_methods(path, original, new)
+                        unaffected = self.dialect_reads.unrelated(tables) & ~keep
+                    if subset_safe and unaffected & memory_bit:
+                        out.dialect_subset_safe = True
+                    # Attribute each proof to the edited module. Other paths
+                    # can already require the test or add it later in this loop.
+                    omit = unaffected & ~(prior | self.index["heap_observers"])
+                    out.direct &= ~omit
+                    out.broad &= ~omit
+                    out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 
