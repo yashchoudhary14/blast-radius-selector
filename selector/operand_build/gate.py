@@ -42,6 +42,7 @@ def main():
     p.add_argument("--base")
     p.add_argument("--set", nargs="*")
     args = p.parse_args()
+    regressions = 0
     for data in DATA:
         if args.set and data.name not in args.set:
             continue
@@ -49,6 +50,8 @@ def main():
         if not args.base:
             continue
         before = load(WORK / f"{args.base}-{data.name}.jsonl")
+        if before.keys() != after.keys():
+            raise ValueError(f"baseline patch list differs for {data.name}")
         dropped = {c: sorted(before[c] - row) for c, row in after.items() if before[c] - row}
         print(f"{len(dropped)} narrowed commits, {sum(map(len,dropped.values()))} dropped pairs", flush=True)
         if data.name == "fresh":
@@ -61,8 +64,11 @@ def main():
             continue
         answers = json.loads((data / "answers.json").read_bytes())["commits"]
         new_misses = {c: sorted(set(row) & set(answers[c]["failing"])) for c, row in dropped.items()}
-        print("new missed failures", {c: v for c, v in new_misses.items() if v}, flush=True)
+        new_misses = {c: v for c, v in new_misses.items() if v}
+        regressions += sum(map(len, new_misses.values()))
+        print("new missed failures", new_misses, flush=True)
+    return bool(regressions)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
