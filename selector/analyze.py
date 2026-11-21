@@ -31,7 +31,7 @@ from .source_equivalence import (_same_directives_text_only, added_binding, comp
                                  dead_statement, docstring_edit, extracted_expression,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
                                  relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
-                                 text_message_only)
+                                 text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
 from .workers import schedule
@@ -239,6 +239,12 @@ class Candidates:
     query_spans: dict | None = field(default_factory=dict)
     query_blocked: int = 0
     query_subsets: dict = field(default_factory=dict)
+    reasons: list[tuple[str, str]] = field(default_factory=list)
+    paths: tuple[str, ...] = ()
+
+    def mark_broken(self, reason, path):
+        self.broken = True
+        self.reasons.append((reason, path))
 
     @property
     def mask(self):
@@ -734,6 +740,11 @@ class Analyzer:
         if scope_edits or headers:
             if same_code(before, compiled) and same_directives(old, new):
                 return 0  # Independent source readers were already selected.
+        if scope_edits and type_checking_imports(old_tree, new_tree) and _same_directives_text_only(old, new):
+            # The pinned runtime never sets typing.TYPE_CHECKING. Source and
+            # bytecode observers can still see the dormant imports or moved lines.
+            return (self.location_observers(all_dynamic=True) | self.state_refs.mask("co_consts")
+                    | self.doc_observers())
         if scope_edits and reordered_statements(old, new, old_tree, new_tree, path) and same_directives(old, new):
             return self.location_observers(all_dynamic=True)
         doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
@@ -752,7 +763,7 @@ class Analyzer:
                 status, rows = probe()
                 if status == "broken" and out is not None:
                     out.broad |= coverage | self.importers[path] | self.file_tests[path]
-                    out.broken = True
+                    out.mark_broken("docstring-state-broken", path)
                     return 0
                 if status == "ok" and all(r[1] == "__doc__" for r in rows):
                     return self.doc_observers() | loc
@@ -799,7 +810,7 @@ class Analyzer:
                     status, _ = probe()
                     if status == "broken" and out is not None:
                         out.broad |= coverage | self.importers[path] | self.file_tests[path]
-                        out.broken = True
+                        out.mark_broken("signature-state-broken", path)
                         return 0
                     if status != "ok":
                         return None
@@ -809,6 +820,7 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
+        out.paths = tuple(edits)
         isolated_tests = self.isolated_test_edits(edits)
         # Only verified test-method edits can accompany a single production edit.
         production_count = len(edits) - len(isolated_tests)
@@ -890,6 +902,7 @@ class Analyzer:
                     out.dialect_subset_safe = False
             if new is None or created:
                 out.structural = True
+                out.reasons.append(("path-created" if created else "path-deleted", path))
                 out.dialect_subset_safe = False
                 directory = p.parent
                 while not (self.base / directory).is_dir():
@@ -900,7 +913,7 @@ class Analyzer:
                 # pytest reads these at startup (markers, addopts, filterwarnings=error, plugins): any test
                 # can change outcome, and the unittest probes never load them.
                 out.broad |= self.all_tests
-                out.broken = True
+                out.mark_broken("pytest-config", path)
                 continue
             if p.suffix == ".py":
                 out.python_paths.append(path)
@@ -910,12 +923,12 @@ class Analyzer:
                         # The full suite can observe writes from a module or test
                         # that an isolated execution probe never loads or runs.
                         out.broad |= self.all_tests
-                        out.broken = True
+                        out.mark_broken("interpreter-settings", path)
                         continue
                 if p.name == "conftest.py" and (p.parent == Path(".") or p.parts[0] == "tests"):
                     # Even a nested conftest can change the entire item list.
                     out.broad |= self.all_tests
-                    out.broken = True
+                    out.mark_broken("conftest", path)
                     continue
                 if path.startswith("tests/") and (p.match("test_*.py") or p.match("*_test.py")
                                                   or self.importers[path]):
@@ -923,7 +936,7 @@ class Analyzer:
                         # Shared changes during full-suite collection are invisible to
                         # probes that import only the test modules they execute.
                         out.broad |= self.all_tests
-                        out.broken = True
+                        out.mark_broken("collection-actions", path)
                         continue
                 if created:
                     lookup = p.parent.as_posix() + ".py" if p.name == "__init__.py" else path
@@ -950,6 +963,7 @@ class Analyzer:
                     out.broad |= test.broad
                     out.priority |= test.priority
                     out.broken |= test.broken
+                    out.reasons.extend(test.reasons)
                     consumers = (self.file_tests[path] | self.importers[path]
                                  | self.index["all_hits"].get(path, 0) | test.mask | readers)
                     out.query_blocked |= consumers
@@ -1304,25 +1318,27 @@ class Analyzer:
 
     def _dict_key_candidates(self, path, new):
         """Use named lookup evidence for string keys and retain whole-table users."""
-        before = ast.parse((self.base / path).read_bytes())
+        old_source = (self.base / path).read_bytes()
+        before = ast.parse(old_source)
         after = ast.parse(new)
         left, left_ambiguous = _class_dict_nodes(before)
         right, right_ambiguous = _class_dict_nodes(after)
         if left_ambiguous or right_ambiguous or left.keys() != right.keys():
             return None
         changes = {}
+        reordered = set()
         for owner, attr in left:
             old, revised = left[owner, attr], right[owner, attr]
-            if len(old.keys) == len(revised.keys):
-                continue
-            if not attr.isupper() or attr.startswith("_"):
-                return None
             old_keys = _literal_string_keys(old)
             new_keys = _literal_string_keys(revised)
             if old_keys is None or new_keys is None:
-                return None
+                continue  # The full AST comparison rejects changes here.
             removed, added = old_keys - new_keys, new_keys - old_keys
             if not (removed or added):
+                if attr.isupper() and not attr.startswith("_") and _restore_dict_order(old, revised, old_keys):
+                    reordered.add(attr)
+                continue
+            if not attr.isupper() or attr.startswith("_"):
                 return None
             for mapping, keys in ((old, removed), (revised, added)):
                 entries = []
@@ -1334,9 +1350,14 @@ class Analyzer:
                 mapping.keys = [key for key, _ in entries]
                 mapping.values = [value for _, value in entries]
             changes.setdefault(attr, set()).update(removed | added)
-        if not changes or ast.dump(before) != ast.dump(after):
+        if (not (changes or reordered) or ast.dump(before) != ast.dump(after)
+                or not _same_directives_text_only(old_source, new)):
             return None
         mask = self.location_observers()
+        if reordered:
+            mask |= self.location_observers(all_dynamic=True) | (self.index["heap_observers"] & self.importers[path])
+            for attr in reordered:
+                mask |= self.state_refs.mask(attr)
         for attr, keys in changes.items():
             mask |= self.state_refs.mask(attr, tuple(sorted(keys)))
         return mask & self.binding_users(path)
@@ -1352,13 +1373,25 @@ class Analyzer:
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
-            out.broken = True
+            out.mark_broken("module-deleted" if new is None else "compile-error", path)
             return
         if diagnostics and diagnostics != self.old_compiled(path)[1]:
             # The grader can promote a compile-time warning to an import error.
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
-            out.broken = True
+            out.mark_broken("compile-warning", path)
             return
+        if single_edit and path == "tests/__init__.py" and len(tree.body) == 1:
+            doc = ast.get_docstring(tree, clean=False)
+            if (doc is not None and ">>>" not in doc and not (self.base / path).read_bytes()
+                    and _same_directives_text_only(b"", new)):
+                # The empty package now sets only __doc__. Keep readers of
+                # source, module attributes, docs and import-time allocations.
+                out.direct |= (self.doc_observers() | self.location_observers(all_dynamic=True)
+                               | self.state_refs.mask("*module")
+                               | (self.index["heap_observers"] & self.importers[path]))
+                out.dialect_subset_safe = False
+                out.query_spans = None
+                return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
@@ -1682,7 +1715,7 @@ class Analyzer:
                         if import_clean is None:
                             status, rows = probe()
                             if status == "broken":
-                                out.broken = True
+                                out.mark_broken("body-state-broken", path)
                                 out.broad |= coverage | self.importers[path]
                                 return None
                             import_clean = (status == "ok" and all((r[0], r[1]) in changed_symbols for r in rows))
@@ -1812,12 +1845,12 @@ class Analyzer:
             reason, mark_broken = skip_reason()
             if reason is not None:
                 if mark_broken:
-                    out.broken = True
+                    out.mark_broken(f"state-skipped-{reason}", path)
                 print(f"state {path} status=skipped reason={reason}", file=sys.stderr)
             else:
                 status, rows = probe()
                 if status == "broken":
-                    out.broken = True
+                    out.mark_broken("scope-state-broken", path)
                     out.broad |= coverage | self.importers[path]
                     return
                 if status == "ok" and not changed:
@@ -1925,6 +1958,24 @@ def _literal_string_keys(mapping):
         return None
     keys = {key.value for key in explicit}
     return keys if len(keys) == len(explicit) else None
+
+
+def _restore_dict_order(old, revised, keys):
+    """Restore a permutation of inert entries before any unchanged unpacking."""
+    size = len(keys)
+    old_order = [node.value if node is not None else None for node in old.keys[:size]]
+    new_order = [node.value if node is not None else None for node in revised.keys[:size]]
+    if old_order == new_order or None in old_order or None in new_order:
+        return False
+    for i, (before, after) in enumerate(zip(old_order, new_order)):
+        if before != after and not (_inert_dict_value(old.values[i]) and _inert_dict_value(revised.values[i])):
+            return False
+    # Comparing the complete AST after restoration checks values, unpacking
+    # and every other statement. Consumers of iteration order remain selected.
+    by_key = {key: (revised.keys[i], revised.values[i]) for i, key in enumerate(new_order)}
+    revised.keys[:size] = [by_key[key][0] for key in old_order]
+    revised.values[:size] = [by_key[key][1] for key in old_order]
+    return True
 
 
 def _class_dict_nodes(tree):

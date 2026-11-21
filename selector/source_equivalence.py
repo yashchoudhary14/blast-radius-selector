@@ -849,6 +849,55 @@ def _binds(node, name):
     return False
 
 
+def type_checking_imports(old, new):
+    """Verify only imports in existing, inactive module-level typing guards changed."""
+    if len(old.body) != len(new.body):
+        return False
+
+    def imports(stmt):
+        return (isinstance(stmt, ast.ImportFrom) and stmt.module != "__future__"
+                and all(alias.name != "*" for alias in stmt.names))
+
+    bindings = {}
+    restored = []
+    for before, after in zip(old.body, new.body):
+        if isinstance(before, ast.Import):
+            for alias in before.names:
+                if alias.name == "typing":
+                    bindings[alias.asname or alias.name] = alias
+        if not isinstance(before, ast.If) or not isinstance(after, ast.If):
+            continue
+        test = before.test
+        if not (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                and isinstance(test.value, ast.Name) and test.value.id in bindings):
+            continue
+
+        if [ast.dump(stmt) for stmt in before.body] == [ast.dump(stmt) for stmt in after.body]:
+            continue
+        if ([ast.dump(stmt) for stmt in before.body if not imports(stmt)]
+                != [ast.dump(stmt) for stmt in after.body if not imports(stmt)]):
+            return False
+        name = test.value.id
+        # Comprehension iteration variables cannot rebind the module name.
+        local_targets = {target for node in ast.walk(old) if isinstance(node, ast.comprehension)
+                         for target in ast.walk(node.target)}
+        if any((node is not bindings[name] and node not in local_targets and _binds(node, name))
+               or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == name
+               or isinstance(node, ast.MatchMapping) and node.rest == name
+               or (isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING"
+                   and not isinstance(node.ctx, ast.Load)) for node in ast.walk(old)):
+            return False
+        restored.append((after, after.body, before.body))
+
+    for node, _, original in restored:
+        node.body = original
+    try:
+        return bool(restored) and ast.dump(old) == ast.dump(new)
+    finally:
+        for node, updated, _ in restored:
+            node.body = updated
+
+
 def added_binding(old, new, insertion, path, compiled):
     """Find one fresh binding with no eager computation besides a cached import."""
     first, count = insertion

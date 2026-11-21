@@ -7,7 +7,9 @@ from pathlib import PurePosixPath
 
 
 class PatchError(ValueError):
-    pass
+    def __init__(self, message, reason="patch-error"):
+        super().__init__(message)
+        self.reason = reason
 
 
 HEADER = re.compile(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*|)$")
@@ -146,7 +148,7 @@ def changes(base, patch):
                 if value == b"120000" and (key in MODE_HEADERS or lines[i].startswith(b"index ")):
                     # Passing link target bytes to the regular-file overlay can
                     # make a probe pass even when the actual link breaks a test.
-                    raise PatchError("symlink patches are unsupported")
+                    raise PatchError("symlink patches are unsupported", "symlink-patch")
                 if lines[i].startswith((b"rename ", b"copy ")):
                     operation, key, value = lines[i].split(b" ", 2)
                     meta[b"operation"] = operation
@@ -154,7 +156,8 @@ def changes(base, patch):
                 elif key in MODE_HEADERS:
                     meta[key] = int(value, 8)
                 elif not lines[i].startswith((b"index ", b"similarity index ", b"dissimilarity index ")):
-                    raise PatchError(f"unsupported patch header {lines[i][:120]!r}")
+                    reason = "binary-patch" if lines[i].startswith((b"GIT binary patch", b"Binary files ")) else "patch-error"
+                    raise PatchError(f"unsupported patch header {lines[i][:120]!r}", reason)
                 i += 1
 
         hunks = i < len(lines) and lines[i].startswith(b"--- ")
@@ -176,7 +179,7 @@ def changes(base, patch):
             raise PatchError("missing file name")
         try:
             if old and (base / old).is_symlink():
-                raise PatchError("symlink patches are unsupported")
+                raise PatchError("symlink patches are unsupported", "symlink-patch")
             if any(not (base / p).resolve().is_relative_to(base) for p in (old, new) if p):
                 raise PatchError("path outside checkout")
             source = (base / old).read_bytes() if old else b""
