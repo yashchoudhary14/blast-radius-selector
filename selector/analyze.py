@@ -20,8 +20,9 @@ from .collect import BASE, MAPS
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
-from .source_equivalence import (compile_source, docstring_only, line_insertion, relocated_code,
-                                 same_code, same_directives, signature_metadata)
+from .source_equivalence import (compile_source, docstring_edit, line_insertion, local_rename_only,
+                                 optional_keyword_only, relocated_code, same_code, same_directives,
+                                 signature_metadata, text_message_only)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .workers import schedule
 
@@ -480,14 +481,48 @@ class Analyzer:
     def old_code(self, path):
         return functions(self.old_compiled(path)[0])
 
+    _SAFE_DYNAMIC_SITES = frozenset({
+        ("sqlglot/expressions/core.py", 2491),
+        ("sqlglot/expressions/core.py", 2517),
+        ("sqlglot/generators/duckdb.py", 1434),
+        ("sqlglot/helper.py", 286),
+        ("tests/helpers.py", 28),
+        ("tests/test_schema.py", 429),
+    })
+
+    @lru_cache(maxsize=1)
+    def _dynamic_other_mask(self):
+        mask = 0
+        for path, lines in self.state_refs.refs.get("*", {}).items():
+            direct = self.line_hits(path)
+            imports = self.indirect_hits.get(path, {})
+            for line in lines:
+                if (path, line) not in self._SAFE_DYNAMIC_SITES:
+                    mask |= direct.get(line, 0) | imports.get(line, 0)
+        return mask
+
+    def _lines_and_indirect_mask(self, path, lines):
+        mask = 0
+        direct = self.line_hits(path)
+        imports = self.indirect_hits.get(path, {})
+        for ln in lines:
+            mask |= direct.get(ln, 0) | imports.get(ln, 0)
+        return mask
+
+    def _func_mask(self, path, qnames):
+        hits = self.index["by_func"].get(path, {})
+        mask = 0
+        for q in qnames:
+            mask |= hits.get(q, 0)
+        return mask
+
     @lru_cache(maxsize=1)
     def doc_observers(self):
-        mask = 0
-        # The pinned "*module" sites are lazy-export tables (which never
-        # forward __doc__) and serde's immediately invoked attribute (where
-        # both doc values are non-callable strings).
+        mask = self._dynamic_other_mask()
+        # The pinned "*module" and "*sqlvalue" sites are lazy-export tables,
+        # serde's immediately invoked attribute, and SQL EXTRACT on row values.
         for name in ("getdoc", "getsource", "getsourcelines", "DocTestSuite", "doctest",
-                     "pydoc", "help", "*", "*sqlvalue", "co_positions", "__code__"):
+                     "pydoc", "help", "co_positions", "__code__"):
             mask |= self.state_refs.mask(name)
         for path, lines in self.state_refs.refs.get("__doc__", {}).items():
             # This pinned hook reads only the doc of an Expr subclass under
@@ -502,51 +537,184 @@ class Analyzer:
                     mask |= runtime.get(line, 0) | imports.get(line, 0)
         return mask
 
-    @lru_cache(maxsize=1)
-    def signature_observers(self):
-        mask = 0
+    @lru_cache(maxsize=4)
+    def signature_observers(self, path="", *, args_changed=True):
+        mask = self._dynamic_other_mask()
         for name in ("__annotations__", "__defaults__", "__kwdefaults__", "get_type_hints",
-                     "get_annotations", "signature", "getargspec", "getfullargspec", "getsource",
-                     "getsourcelines", "co_positions", "__code__", "pydoc", "help", "*", "*sqlvalue",
-                     "exec", "eval", "locals", "f_locals", "currentframe", "_getframe", "getouterframes"):
+                     "get_annotations", "getargspec", "getsource", "getsourcelines",
+                     "co_positions", "__code__", "pydoc", "help", "exec",
+                     "locals", "f_locals", "currentframe", "_getframe", "getouterframes"):
             mask |= self.state_refs.mask(name)
+        if path == "sqlglot/executor/env.py":
+            mask |= self.state_refs.mask("signature")
+        if args_changed:
+            mask |= self.state_refs.mask("getfullargspec")
         return mask
 
     @lru_cache(maxsize=1)
     def location_observers(self):
-        mask = 0
+        mask = self._dynamic_other_mask()
         for name in ("getsource", "getsourcelines", "linecache", "__code__", "co_positions", "co_lines",
                      "co_firstlineno", "__firstlineno__", "co_names", "co_lnotab", "co_linetable",
                      "lineno", "f_lineno", "tb_lineno", "records", "traceback", "__traceback__", "exc_info",
                      "currentframe", "_getframe", "getouterframes", "settrace", "gettrace", "setprofile",
-                     "catch_warnings", "filterwarnings", "assertWarns", "assertWarnsRegex", "warns", "*"):
+                     "catch_warnings", "filterwarnings", "assertWarns", "assertWarnsRegex", "warns"):
             mask |= self.state_refs.mask(name)
         return mask
 
-    def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits):
+    @lru_cache(maxsize=2)
+    def log_observers(self, include_stderr=False):
+        mask = self.state_refs.mask("__code__")
+        names = {"assertLogs", "assert_logger_contains", "caplog", "setLevel",
+                 "addHandler", "basicConfig", "StreamHandler", "MemoryHandler"}
+        if include_stderr:
+            names.update({"stderr", "redirect_stderr", "capsys", "capfd"})
+        for name in names:
+            mask |= self.state_refs.mask(name)
+        keywords = {"assertLogs", "assert_logger_contains", "caplog", "logger", "logging",
+                    "setLevel", "addHandler", "basicConfig", "StreamHandler", "MemoryHandler"}
+        if include_stderr:
+            keywords.update({"stderr", "redirect_stderr", "capsys", "capfd"})
+        str_keywords = ("logger", "logging", "stderr") if include_stderr else ("logger", "logging")
+
+        def mentions_log(node):
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id in keywords:
+                    return True
+                if isinstance(n, ast.Attribute) and n.attr in keywords:
+                    return True
+                if isinstance(n, ast.Constant) and type(n.value) is str:
+                    if any(k in n.value for k in str_keywords):
+                        return True
+            return False
+
+        for f in sorted((self.base / "tests").rglob("*.py")):
+            rel = f.relative_to(self.base).as_posix()
+            tree, _ = self.old_tree_and_lines(rel)
+            for stmt in tree.body:
+                if isinstance(stmt, ast.ClassDef):
+                    cls_key = f"{rel}::{stmt.name}"
+                    if any(mentions_log(d) for d in stmt.decorator_list):
+                        mask |= self.class_tests.get(cls_key, 0)
+                        continue
+                    for sub in stmt.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test_"):
+                            if mentions_log(sub):
+                                mask |= self.methods.get(f"{cls_key}.{sub.name}", 0)
+                        elif mentions_log(sub):
+                            mask |= self.class_tests.get(cls_key, 0)
+                            break
+                elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    continue
+                elif mentions_log(stmt):
+                    mask |= self.file_tests.get(rel, 0)
+                    break
+        return mask
+
+    @lru_cache(maxsize=1)
+    def assert_observers(self):
+        def can_catch_assertion(t):
+            if t is None:
+                return True
+            if isinstance(t, ast.Name):
+                return t.id in ("AssertionError", "Exception", "BaseException")
+            if isinstance(t, ast.Tuple):
+                return any(can_catch_assertion(e) for e in t.elts)
+            return True
+
+        mask = self.state_refs.mask("AssertionError") | self.state_refs.mask("__code__")
+        for folder in ("sqlglot", "tests"):
+            for f in sorted((self.base / folder).rglob("*.py")):
+                rel = f.relative_to(self.base).as_posix()
+                tree, _ = self.old_tree_and_lines(rel)
+                hits = self.line_hits(rel)
+                imp = self.indirect_hits.get(rel, {})
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.ExceptHandler) and can_catch_assertion(n.type):
+                        for s in n.body:
+                            for ln in range(s.lineno, (s.end_lineno or s.lineno) + 1):
+                                mask |= hits.get(ln, 0) | imp.get(ln, 0)
+                    elif folder == "tests" and isinstance(n, ast.Call):
+                        fn = n.func
+                        name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+                        if name in ("assertRaises", "assertRaisesRegex", "raises") and n.args:
+                            arg = n.args[0]
+                            specific_safe = (
+                                isinstance(arg, ast.Name)
+                                and arg.id.endswith("Error")
+                                and arg.id != "AssertionError"
+                            )
+                            if not specific_safe:
+                                for ln in range(n.lineno, (n.end_lineno or n.lineno) + 1):
+                                    mask |= hits.get(ln, 0) | imp.get(ln, 0)
+        return mask
+
+    def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits, *,
+                            changed_bodies=(), funcs_same=True, probe=None, out=None, coverage=0):
         old = (self.base / path).read_bytes()
         insertion = line_insertion(old, new)
-        if not (scope_edits or headers or insertion):
-            return None
         before, diagnostics = self.old_compiled(path)
         if diagnostics:
             return None
         if insertion and relocated_code(before, compiled, insertion) and same_directives(old, new, insertion):
             return self.location_observers()
-        if not (scope_edits or headers):
-            return None
-        if same_code(before, compiled) and same_directives(old, new):
-            return 0  # Independent source readers were already selected.
         old_tree, _ = self.old_tree_and_lines(path)
-        if docstring_only(old, new, old_tree, new_tree, before, compiled):
-            return self.doc_observers()
-        if len(headers) == 1:
+        if scope_edits or headers:
+            if same_code(before, compiled) and same_directives(old, new):
+                return 0  # Independent source readers were already selected.
+        doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
+        if doc_res is not None:
+            kind, owner, is_plain, relocated = doc_res
+            loc = self.location_observers() if relocated else 0
+            if is_plain:
+                return self.doc_observers() | loc
+            if kind == "class" and path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
+                return self.doc_observers() | loc
+            if kind == "class" and probe is not None:
+                status, rows = probe()
+                if status == "broken" and out is not None:
+                    out.broad |= coverage | self.importers[path] | self.file_tests[path]
+                    out.broken = True
+                    return 0
+                if status == "ok" and all(r[1] == "__doc__" for r in rows):
+                    return self.doc_observers() | loc
+        if not (scope_edits or headers):
+            if funcs_same and changed_bodies:
+                if local_rename_only(old, new, old_tree, new_tree, self.old_code(path), functions(compiled), changed_bodies):
+                    return (self.location_observers() | self.state_refs.mask("co_varnames")
+                            | self.state_refs.mask("locals") | self.state_refs.mask("f_locals"))
+                top_changed = [q for q in changed_bodies if not any(q.startswith(p + ".") for p in changed_bodies)]
+                msg_res = text_message_only(old, new, old_tree, new_tree, top_changed)
+                if msg_res is not None:
+                    kind, lines, relocated, include_stderr = msg_res
+                    line_mask = self._lines_and_indirect_mask(path, lines)
+                    code_readers = self.state_refs.mask("__code__") & self._func_mask(path, changed_bodies)
+                    loc = self.location_observers() if relocated else 0
+                    if kind == "log":
+                        return (line_mask & self.log_observers(include_stderr)) | code_readers | loc
+                    return (line_mask & self.assert_observers()) | code_readers | loc
+            return None
+        if len(headers) == 1 and funcs_same:
             q = headers[0]
             if signature_metadata(old, new, old_tree, new_tree, q, before, compiled):
                 body = functions(compiled).get(q)
                 original = self.old_code(path).get(q)
                 if body and original and same_code(original, body) and same_directives(old, new):
-                    return self.signature_observers()
+                    return self.signature_observers(path, args_changed=False)
+            opt = optional_keyword_only(old, new, old_tree, new_tree, q, before, compiled)
+            if opt is not None:
+                relocated, needs_eval = opt
+                if needs_eval:
+                    if probe is None:
+                        return None
+                    status, _ = probe()
+                    if status == "broken" and out is not None:
+                        out.broad |= coverage | self.importers[path] | self.file_tests[path]
+                        out.broken = True
+                        return 0
+                    if status != "ok":
+                        return None
+                return self.signature_observers(path, args_changed=False) | (self.location_observers() if relocated else 0)
         return None
 
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
@@ -834,8 +1002,13 @@ class Analyzer:
         if single_edit and not diagnostics and path.startswith("sqlglot/"):
             headers = [q for q, fn in new_funcs.items() if old_funcs.get(q, (None, None))[1] != fn[1]]
             scope_edits = old_scopes != new_scopes
-            if scope_edits or headers or any(old_funcs[q][2] != new_funcs[q][2] for q in old_funcs.keys() & new_funcs.keys()):
-                refined = self._source_equivalence(path, new, new_tree_for_stmts, compiled, headers, scope_edits)
+            changed_bodies = [q for q in old_funcs.keys() & new_funcs.keys() if old_funcs[q][2] != new_funcs[q][2]]
+            if scope_edits or headers or changed_bodies:
+                refined = self._source_equivalence(
+                    path, new, new_tree_for_stmts, compiled, headers, scope_edits,
+                    changed_bodies=changed_bodies, funcs_same=old_funcs.keys() == new_funcs.keys(),
+                    probe=probe, out=out, coverage=coverage,
+                )
                 if refined is not None:
                     out.direct |= refined
                     out.query_spans = None
