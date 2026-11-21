@@ -55,7 +55,7 @@ def overlay_matches(root, paths):
     return found == set(paths)
 
 
-def can_prove_pass(test_number, changed_spans, data_changed_modules, overlay_root, *, deadline=None) -> bool | None:
+def can_prove_pass(test_number, changed_spans, data_changed_modules, overlay_root, *, deadline=None, diagnostic=None) -> bool | None:
     """Spans are inclusive old-line pairs keyed by every changed checkout-relative path."""
     if test_number not in TESTS or changed_spans is None or data_changed_modules is None:
         return None
@@ -75,10 +75,14 @@ def can_prove_pass(test_number, changed_spans, data_changed_modules, overlay_roo
                     return None
                 i = bisect.bisect_left(lines, start)
                 if i < len(lines) and lines[i] <= end:
+                    if diagnostic is not None:
+                        diagnostic.append(f"protected:{path}:{lines[i]}")
                     return None
             paths.append(path)
         root = Path(overlay_root).resolve(strict=True)
         if not overlay_matches(root, paths):
+            if diagnostic is not None:
+                diagnostic.append("overlay-mismatch")
             return None
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0",
                    PYTHONDONTWRITEBYTECODE="1", OPENBLAS_NUM_THREADS="1", SKIP_INTEGRATION="0")
@@ -91,7 +95,11 @@ def can_prove_pass(test_number, changed_spans, data_changed_modules, overlay_roo
                               cwd=root, env=env, start_new_session=True, stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as child:
             try:
-                return True if child.wait(timeout=timeout) == 83 else None
+                if child.wait(timeout=timeout) == 83:
+                    return True
+                if diagnostic is not None:
+                    diagnostic.append("guard-or-boundary-mismatch")
+                return None
             finally:
                 if child.poll() is None:
                     os.killpg(child.pid, signal.SIGKILL)
