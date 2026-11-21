@@ -86,10 +86,12 @@ def evidence(number):
 
 
 class PatchProof:
-    def __init__(self, analyzer, patch):
+    def __init__(self, analyzer, patch, isolated_tests=()):
         self.files = {}
         self.analyzer = analyzer
         for path, new in changes(analyzer.base, patch).items():
+            if path in isolated_tests:
+                continue
             base = analyzer.base / path
             if not (path.startswith("sqlglot/") and path.endswith(".py") and new and base.is_file()):
                 self.files.clear()

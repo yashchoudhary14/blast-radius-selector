@@ -187,9 +187,12 @@ class Execution:
                 f"modules={len({self.files[n] for n in ran})} complete={int(complete)}")
             return complete and not result.import_error and bool(ran)
 
-        eligible = set(PROOF_CPU) & selected
+        edited_tests = 0
+        for mask in candidates.isolated_test_paths.values():
+            edited_tests |= mask
+        eligible = {n for n in PROOF_CPU.keys() & selected if not edited_tests & (1 << n)}
         if eligible:
-            proof = PatchProof(self.analyzer, patch)
+            proof = PatchProof(self.analyzer, patch, candidates.isolated_test_paths)
             for n in sorted(eligible, key=self.millis.get, reverse=True):
                 start = cpu_time()
                 reason = proof.witness(n)
