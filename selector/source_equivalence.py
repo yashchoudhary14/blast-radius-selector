@@ -2,9 +2,11 @@
 
 import __future__
 import ast
+import collections.abc
 import dis
 import inspect
 import marshal
+import operator
 import re
 import tokenize
 import warnings
@@ -391,6 +393,17 @@ def _isolated_change(old_source, source, old, new):
             and _outside(old_source, old) == _outside(source, new))
 
 
+def postponed_annotation(old_source, source, old_tree, tree, name, before, after):
+    if not before.co_flags & after.co_flags & __future__.annotations.compiler_flag:
+        return False
+    old, revised = _plain_function(old_tree, name), _plain_function(tree, name)
+    if old is None or revised is None:
+        return False
+    old_annotations, _ = _signature_parts(old)
+    annotations, _ = _signature_parts(revised)
+    return any(_isolated_change(old_source, source, a, b) for a, b in zip(old_annotations, annotations))
+
+
 def signature_metadata(old_source, source, old_tree, tree, name, before, after):
     """Accept one postponed annotation or one unused, scalar default value."""
     old = _plain_function(old_tree, name)
@@ -760,6 +773,227 @@ def line_insertion(before, after):
     if old[first:] == new[first + count:]:
         return first + 1, count
     return None
+
+
+def dead_statement(old, new, insertion):
+    """Prove a single inert statement was inserted into an existing suite."""
+    first, count = insertion
+    for owner in ast.walk(new):
+        for field, suite in ast.iter_fields(owner):
+            if not isinstance(suite, list):
+                continue
+            for index, stmt in enumerate(suite):
+                if not isinstance(stmt, ast.stmt) or not first <= stmt.lineno <= stmt.end_lineno < first + count:
+                    continue
+                # A nested class can capture function variables. A plain name
+                # assignment has no binding effect in these suites.
+                module_scope = owner is new or (isinstance(owner, ast.ClassDef) and owner in new.body)
+                dead_branch = (module_scope and field == "body" and isinstance(stmt, ast.If) and not stmt.orelse
+                               and isinstance(stmt.test, ast.Constant) and stmt.test.value is False
+                               and len(stmt.body) == 1 and isinstance(stmt.body[0], ast.Assign)
+                               and all(isinstance(t, ast.Name) for t in stmt.body[0].targets)
+                               and isinstance(stmt.body[0].value, ast.Constant))
+                # This raise cannot change local or closure bindings or mark
+                # an otherwise synchronous function as a generator.
+                dead_raise = (index > 0 and isinstance(suite[index - 1], ast.Return)
+                              and isinstance(stmt, ast.Raise) and stmt.cause is None
+                              and isinstance(stmt.exc, ast.Call) and isinstance(stmt.exc.func, ast.Name)
+                              and not stmt.exc.keywords and all(isinstance(a, ast.Constant) for a in stmt.exc.args))
+                # Preserve the first-statement docstring rule in every suite.
+                if index and (dead_branch or dead_raise):
+                    setattr(owner, field, suite[:index] + suite[index + 1:])
+                    try:
+                        return ast.dump(old) == ast.dump(new)
+                    finally:
+                        setattr(owner, field, suite)
+    return False
+
+
+def _literal_binding(node):
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+        return None
+    if all(isinstance(n, (ast.Constant, ast.Tuple, ast.Load)) for n in ast.walk(node.value)):
+        return node.targets[0].id
+    return None
+
+
+def _static_import(node):
+    if not isinstance(node, ast.ImportFrom) or node.level:
+        return False
+    # These stdlib modules publish concrete bindings, without lazy attribute lookup.
+    module = {"collections.abc": collections.abc, "operator": operator}.get(node.module)
+    return module is not None and all(a.name in vars(module) and not a.name.startswith("_") for a in node.names)
+
+
+def _dialect_classes(tree, path):
+    if not path.startswith("sqlglot/dialects/") or not any(
+        isinstance(n, ast.ImportFrom) and n.level == 0 and n.module == "sqlglot.dialects.dialect"
+        and any(a.name == "Dialect" and a.asname is None for a in n.names) for n in tree.body
+    ):
+        return []
+    # The pinned Dialect metaclass uses an ordinary namespace, reads its
+    # members by key and has no order-dependent hook for plain scalar data.
+    return [n for n in tree.body if isinstance(n, ast.ClassDef) and not n.keywords and not n.decorator_list
+            and len(n.bases) == 1 and isinstance(n.bases[0], ast.Name) and n.bases[0].id == "Dialect"]
+
+
+def _binds(node, name):
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name.partition(".")[0]) in (name, "*")
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return node.name in (name, "__getattr__")
+    return False
+
+
+def added_binding(old, new, insertion, path, compiled):
+    """Find one fresh binding with no eager computation besides a cached import."""
+    first, count = insertion
+    for scope in [new, *_dialect_classes(new, path)]:
+        for index, stmt in enumerate(scope.body):
+            if not (first <= stmt.lineno <= stmt.end_lineno < first + count):
+                continue
+            name = _literal_binding(stmt)
+            if scope is new and isinstance(stmt, ast.FunctionDef):
+                args = stmt.args
+                annotations, _ = _signature_parts(stmt)
+                if ((not any(annotations) or compiled.co_flags & __future__.annotations.compiler_flag)
+                        and not stmt.decorator_list and not getattr(stmt, "type_params", ())
+                        and not args.defaults and not any(args.kw_defaults)):
+                    name = stmt.name
+            if scope is new and _static_import(stmt) and len(stmt.names) == 1 and stmt.module == "operator":
+                # collections imports operator before returning, so the added
+                # statement only retrieves an existing module and attribute.
+                if any(isinstance(n, ast.ImportFrom) and not n.level and n.module == "collections"
+                       for n in scope.body[:index]):
+                    alias = stmt.names[0]
+                    name = alias.asname or alias.name
+            if (not name or name.startswith("__") or name.endswith("_sql")
+                    or not isinstance(stmt, ast.ImportFrom) and not name.startswith("_")):
+                continue
+            if any(_binds(n, name) or (isinstance(n, ast.Name) and n.id == "__all__") for n in ast.walk(old)):
+                continue
+            body = scope.body
+            scope.body = body[:index] + body[index + 1:]
+            try:
+                if not index and ast.get_docstring(scope, clean=False) is not None:
+                    continue
+                if ast.dump(old) == ast.dump(new):
+                    return name, scope is new
+            finally:
+                scope.body = body
+    return None
+
+
+def _forwarded_expression(node, argument):
+    """Match two expression forms that read only a forwarded argument."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        call = node.operand
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "bool"
+                and not call.keywords and len(call.args) == 1 and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == argument):
+            return "truth"
+    if isinstance(node, ast.GeneratorExp) and len(node.generators) == 1:
+        loop = node.generators[0]
+        if (not loop.is_async and len(loop.ifs) == 1 and isinstance(loop.iter, ast.Name) and loop.iter.id == argument
+                and all(isinstance(n, ast.Name) for n in (loop.target, node.elt, loop.ifs[0]))
+                and loop.target.id == node.elt.id == loop.ifs[0].id):
+            return "filter"
+    return None
+
+
+def extracted_expression(old_source, source, old, new, name, path, compiled):
+    """Check an isolated extraction, leaving call-frame observers to the selector."""
+    helper = _plain_function(new, name)
+    if not name.startswith("_") or helper is None or len(helper.body) != 1 or not isinstance(helper.body[0], ast.Return):
+        return False
+    args = helper.args
+    parameters = args.posonlyargs + args.args
+    if len(parameters) != 1 or args.vararg or args.kwarg or args.kwonlyargs:
+        return False
+    form = _forwarded_expression(helper.body[0].value, parameters[0].arg)
+    if form is None or (form == "truth" and parameters[0].arg == "bool"):
+        return False
+    for fn in new.body:
+        if not isinstance(fn, ast.FunctionDef) or fn is helper or not _plain_function(new, fn.name):
+            continue
+        original = _plain_function(old, fn.name)
+        if original is None:
+            continue
+        for stmt in fn.body:
+            for call in ast.walk(stmt):
+                if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != name
+                        or call.keywords or len(call.args) != 1 or not isinstance(call.args[0], ast.Name)):
+                    continue
+                argument = call.args[0].id
+                if form == "filter":
+                    # The iterable is the caller's unchanged varargs tuple.
+                    if original.args.vararg is None or original.args.vararg.arg != argument or any(
+                        _binds(n, argument) for n in ast.walk(original) if n is not original.args.vararg
+                    ):
+                        continue
+                elif any(_binds(n, "bool") for n in ast.walk(original)):
+                    continue
+                for expr in ast.walk(original):
+                    if _forwarded_expression(expr, argument) != form:
+                        continue
+                    prefix, suffix = _outside(old_source, expr)
+                    left, right = _outside(source, call)
+                    body = old_source[len(prefix):len(old_source) - len(suffix)]
+                    # A sole generator argument can share its parentheses
+                    # with the containing call. Try restoring its inner text.
+                    choices = (body, body[1:-1]) if form == "filter" and body[:1] == b"(" and body[-1:] == b")" else (body,)
+                    for value in choices:
+                        restored = left + value + right
+                        insertion = line_insertion(old_source, restored)
+                        if insertion is None:
+                            continue
+                        try:
+                            restored_tree = ast.parse(restored, path)
+                        except (SyntaxError, ValueError):
+                            continue
+                        if (added_binding(old, restored_tree, insertion, path, compiled) == (name, True)
+                                and same_directives(old_source, source, insertion)):
+                            return True
+    return False
+
+
+def reordered_statements(old_source, source, old, new, path):
+    """Recognize a permutation of independent imports or class assignments."""
+    def imports(node):
+        if not _static_import(node) or len(node.names) < 2:
+            return None
+        if len({a.asname or a.name for a in node.names}) == len(node.names):
+            return node.module, sorted((a.name, a.asname or a.name) for a in node.names)
+        return None
+
+    def pairs(a, b):
+        return (a.lineno, a.end_lineno) == (b.lineno, b.end_lineno)
+
+    for a, b in zip(old.body, new.body):
+        if isinstance(a, ast.ImportFrom) and isinstance(b, ast.ImportFrom) and pairs(a, b):
+            order = imports(a)
+            if order is not None and order == imports(b) and _isolated_change(old_source, source, a, b):
+                return True
+    for a, b in zip(_dialect_classes(old, path), _dialect_classes(new, path)):
+        if a.name != b.name:
+            continue
+        for i in range(min(len(a.body), len(b.body)) - 1):
+            left, right = a.body[i:i + 2]
+            first, last = b.body[i:i + 2]
+            l_name, r_name = _literal_binding(left), _literal_binding(right)
+            if (l_name and r_name and l_name != r_name and not l_name.startswith("__")
+                    and not r_name.startswith("__") and pairs(left, first) and pairs(right, last)
+                    and ast.dump(left) == ast.dump(last) and ast.dump(right) == ast.dump(first)):
+                # Compare the exact bytes before and after the swapped pair.
+                if (_outside(old_source, left)[0] == _outside(source, first)[0]
+                        and _outside(old_source, right)[1] == _outside(source, last)[1]
+                        and right.lineno == left.end_lineno + 1 and last.lineno == first.end_lineno + 1):
+                    return True
+    return False
 
 
 def relocated_code(before, after, insertion):

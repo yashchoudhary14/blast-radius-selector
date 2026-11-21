@@ -20,9 +20,10 @@ from .collect import BASE, MAPS
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
-from .source_equivalence import (compile_source, docstring_edit, line_insertion, local_rename_only,
-                                 optional_keyword_only, relocated_code, same_code, same_directives,
-                                 signature_metadata, text_message_only)
+from .source_equivalence import (added_binding, compile_source, dead_statement, docstring_edit, extracted_expression,
+                                 line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
+                                 relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
+                                 text_message_only)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .workers import schedule
 
@@ -551,9 +552,9 @@ class Analyzer:
             mask |= self.state_refs.mask("getfullargspec")
         return mask
 
-    @lru_cache(maxsize=1)
-    def location_observers(self):
-        mask = self._dynamic_other_mask()
+    @lru_cache(maxsize=2)
+    def location_observers(self, *, all_dynamic=False):
+        mask = self.state_refs.mask("*") if all_dynamic else self._dynamic_other_mask()
         for name in ("getsource", "getsourcelines", "linecache", "__code__", "co_positions", "co_lines",
                      "co_firstlineno", "__firstlineno__", "co_names", "co_lnotab", "co_linetable",
                      "lineno", "f_lineno", "tb_lineno", "records", "traceback", "__traceback__", "exc_info",
@@ -649,6 +650,23 @@ class Analyzer:
                                     mask |= hits.get(ln, 0) | imp.get(ln, 0)
         return mask
 
+    @lru_cache(maxsize=1)
+    def annotation_observers(self):
+        mask = self.location_observers(all_dynamic=True)
+        for name in ("__annotations__", "get_type_hints", "get_annotations", "getargspec", "pydoc", "help", "f_locals"):
+            mask |= self.state_refs.mask(name)
+        # Both pinned callers use only the names of the parameters.
+        for name, names_only_path, names_only_usage in (
+            ("signature", "sqlglot/executor/env.py",
+             b"i for i, param in enumerate(inspect.signature(func).parameters) if param in required"),
+            ("getfullargspec", "sqlglot/optimizer/optimizer.py", b"rule_params = inspect.getfullargspec(rule).args"),
+        ):
+            for path, lines in self.state_refs.refs.get(name, {}).items():
+                for line in lines:
+                    if path != names_only_path or self.old_tree_and_lines(path)[1][line - 1].strip() != names_only_usage:
+                        mask |= self.line_hits(path).get(line, 0) | self.indirect_hits.get(path, {}).get(line, 0)
+        return mask
+
     def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits, *,
                             changed_bodies=(), funcs_same=True, probe=None, out=None, coverage=0):
         old = (self.base / path).read_bytes()
@@ -656,18 +674,44 @@ class Analyzer:
         before, diagnostics = self.old_compiled(path)
         if diagnostics:
             return None
-        if insertion and relocated_code(before, compiled, insertion) and same_directives(old, new, insertion):
-            return self.location_observers()
         old_tree, _ = self.old_tree_and_lines(path)
+        if insertion:
+            if relocated_code(before, compiled, insertion):
+                if same_directives(old, new, insertion):
+                    return self.location_observers()
+            elif (frame_layout(before) == frame_layout(compiled) and dead_statement(old_tree, new_tree, insertion)
+                  and same_directives(old, new, insertion)):
+                return self.location_observers(all_dynamic=True)
+            if scope_edits or headers:
+                binding = added_binding(old_tree, new_tree, insertion, path, before)
+                if binding is not None and same_directives(old, new, insertion):
+                    name, module = binding
+                    module_name = path[:-3].replace("/", ".").removesuffix(".__init__")
+                    if name.startswith("_") or (module_name not in self._test_star_imports()
+                                                and not path.startswith("sqlglot/expressions/")):
+                        mask = self.location_observers(all_dynamic=True) | self.state_refs.mask(name)
+                        # The pinned lazy re-export tables only target their
+                        # own subpackages. Serde round-trips expression classes,
+                        # which this proof never creates or replaces.
+                        if module and path.startswith(("sqlglot/optimizer/", "sqlglot/dialects/",
+                                                       "sqlglot/expressions/")):
+                            mask |= self.state_refs.mask("*module")
+                        return mask | (self.index["heap_observers"] & self.importers[path])
         if scope_edits or headers:
             if same_code(before, compiled) and same_directives(old, new):
                 return 0  # Independent source readers were already selected.
+        if scope_edits and reordered_statements(old, new, old_tree, new_tree, path) and same_directives(old, new):
+            return self.location_observers(all_dynamic=True)
         doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
         if doc_res is not None:
             kind, owner, is_plain, relocated = doc_res
             loc = self.location_observers() if relocated else 0
             if is_plain:
-                return self.doc_observers() | loc
+                mask = self.doc_observers() | loc
+                # H2 also handles same-height module and plain top-level class docs.
+                if not relocated and (kind == "module" or (kind == "class" and "." not in owner)):
+                    mask |= self.state_refs.mask("*") | self.state_refs.mask("*sqlvalue")
+                return mask
             if kind == "class" and path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
                 return self.doc_observers() | loc
             if kind == "class" and probe is not None:
@@ -694,12 +738,23 @@ class Analyzer:
                         return (line_mask & self.log_observers(include_stderr)) | code_readers | loc
                     return (line_mask & self.assert_observers()) | code_readers | loc
             return None
-        if len(headers) == 1 and funcs_same:
+        if len(headers) == 1:
             q = headers[0]
-            if signature_metadata(old, new, old_tree, new_tree, q, before, compiled):
+            if q.startswith("_") and extracted_expression(old, new, old_tree, new_tree, q, path, before):
+                mask = self.location_observers(all_dynamic=True) | self.state_refs.mask(q)
+                for name in ("f_back", "gi_frame", "gi_code", "getprofile", "getrecursionlimit", "format_exc",
+                             "print_exc", "format_exception"):
+                    mask |= self.state_refs.mask(name)
+                return mask | (self.index["heap_observers"] & self.importers[path])
+            if not funcs_same:
+                return None
+            annotation = postponed_annotation(old, new, old_tree, new_tree, q, before, compiled)
+            if annotation or signature_metadata(old, new, old_tree, new_tree, q, before, compiled):
                 body = functions(compiled).get(q)
                 original = self.old_code(path).get(q)
                 if body and original and same_code(original, body) and same_directives(old, new):
+                    if annotation:
+                        return self.annotation_observers()
                     return self.signature_observers(path, args_changed=False)
             opt = optional_keyword_only(old, new, old_tree, new_tree, q, before, compiled)
             if opt is not None:
