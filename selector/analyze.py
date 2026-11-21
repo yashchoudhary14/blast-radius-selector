@@ -240,6 +240,27 @@ class Analyzer:
         source = (self.base / path).read_bytes()
         return ast.parse(source, path), source.splitlines()
 
+    def expr_owners(self, path, owners):
+        """True if every owner is an Expression subclass (by base-class names across sqlglot/expressions)."""
+        if getattr(self, "_expr_classes", None) is None:
+            bases = {}
+            for f in sorted((self.base / "sqlglot/expressions").glob("*.py")):
+                for node in ast.walk(ast.parse(f.read_bytes(), str(f))):
+                    if isinstance(node, ast.ClassDef):
+                        bases.setdefault(node.name, set()).update(
+                            b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
+                            for b in node.bases)
+            expr = {"Expr", "Expression"}
+            grew = True
+            while grew:
+                grew = False
+                for name, names in bases.items():
+                    if name not in expr and names & expr:
+                        expr.add(name)
+                        grew = True
+            self._expr_classes = expr
+        return bool(owners) and all(o.split(".")[-1] in self._expr_classes for o in owners)
+
     @lru_cache(maxsize=32)
     def line_hits(self, path):
         cache = self.maps / "ast" / (path + ".lines")
@@ -385,7 +406,7 @@ class Analyzer:
             skip = set()
             usage = self.index.get("class_usage", {})
             if (dirty and "" not in dirty and usage and path.startswith("sqlglot/expressions/")
-                    and all(f"{path}::{o}" in usage for o in dirty)):
+                    and all(f"{path}::{o}" in usage for o in dirty) and self.expr_owners(path, dirty)):
                 # Expression class-body data (arg_types, flags) executes only while its own module is
                 # imported; its effect reaches tests through the class, which the class-usage refinement
                 # below selects. Function bodies run at import time keep the importer attribution.
@@ -416,7 +437,9 @@ class Analyzer:
         # (tokenizer/parser/generator/dialect cores) have cached or import-time instances whose use
         # is invisible to per-test records (corpus c1/5xwe: TokenizerCore.__slots__), so they keep the
         # conservative rule below.
-        if "" not in dirty and class_usage and path.startswith("sqlglot/expressions/"):
+        # Enum/helper classes (adv k1f1: DType member value) are used by reference, not instantiation.
+        if ("" not in dirty and class_usage and path.startswith("sqlglot/expressions/")
+                and self.expr_owners(path, dirty)):
             matched_all = True
             cls_mask = 0
             for owner in dirty:
