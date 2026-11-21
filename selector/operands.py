@@ -19,6 +19,10 @@ def edits(old, new):
             return a == b
         if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             return ast.dump(a) == ast.dump(b)
+        if isinstance(a, ast.Constant):
+            # AST fields such as 0, False and 0.0 compare equal as Python
+            # objects even though substituting one literal changes code.
+            return ast.dump(a) == ast.dump(b)
         if isinstance(a, ast.Compare) and len(a.ops) == len(b.ops) == 1:
             prior, after = (OPS.index(type(n.ops[0]).__name__) for n in (a, b))
             left, right = a.left, a.comparators[0]
@@ -77,7 +81,7 @@ def member(file, name):
     return marshal.loads(archive(file).read(name))
 
 
-def narrow(maps, path, old, new, mask):
+def narrow(maps, path, old, new, mask, line_hits):
     rules = edits(old, new)
     if not rules:
         return mask
@@ -90,7 +94,14 @@ def narrow(maps, path, old, new, mask):
         key = site.lineno, site.col_offset, type(site).__name__, site.end_col_offset
         if key not in rows:
             return mask
+        observed = 0
         for vectors, bounds, tests in rows[key]:
-            if tests & mask and not unchanged(rule, vectors, bounds):
-                affected |= tests & mask
+            reached = tests & mask
+            observed |= reached
+            if reached and not unchanged(rule, vectors, bounds):
+                affected |= reached
+        # Coverage and operand collection use different processes. Retain
+        # any candidate that reached this line only in the coverage run.
+        for line in range(site.lineno, site.end_lineno + 1):
+            affected |= line_hits.get(line, 0) & mask & ~observed
     return affected

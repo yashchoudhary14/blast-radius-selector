@@ -346,7 +346,7 @@ class Analyzer:
                     out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
                     continue
                 self.python(path, new, out, prioritize=prioritize,
-                            operand_safe=not any(other != path and other.endswith(".py") for other in edits))
+                            operand_safe=len(edits) == 1)
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 
@@ -431,7 +431,7 @@ class Analyzer:
                             stmt_mask |= l_hits.get(ln, 0)
                     if stmt_mask and operand_safe:
                         stmt_mask = ((stmt_mask & self.index["heap_observers"]) |
-                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask))
+                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits))
                     out.direct |= stmt_mask
                 else:
                     out.direct |= hits.get(q, 0)
