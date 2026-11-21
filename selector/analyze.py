@@ -26,6 +26,7 @@ from .dialect_cases import isolated_test_methods
 from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
 from .fixture_cases import unaffected_fixture_tests
+from .memory_edits import same_memory_workload
 from .operands import narrow
 from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
@@ -1042,6 +1043,8 @@ class Analyzer:
                     out.priority &= ~omit
         if not out.broken and not out.structural:
             omit = unaffected_fixture_tests(self, edits)
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit):
+                omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
             out.priority &= ~omit
