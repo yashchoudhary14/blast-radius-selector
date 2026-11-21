@@ -40,25 +40,27 @@ def entry_edits(old, new):
     rules = []
     for name, fn in new_funcs.items():
         prior = old_funcs.get(name)
-        if prior is None or prior.decorator_list or fn.decorator_list or any(
-                isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(prior)):
+        if prior is None or prior.decorator_list or fn.decorator_list:
+            continue
+        guard = leading_guard(fn) if len(fn.body) == len(prior.body) + 1 else None
+        defaults = fn.args.defaults
+        changes = [
+            i for i, (before, after) in enumerate(zip(prior.args.defaults, defaults))
+            if isinstance(before, ast.Constant) and before.value is None
+            and isinstance(after, ast.Constant) and type(after.value) is bool
+        ] if len(defaults) == len(prior.args.defaults) else []
+        if not (guard or changes) or any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(prior)):
             continue
         args = [a.arg for a in (*fn.args.posonlyargs, *fn.args.args)]
-        if len(fn.body) == len(prior.body) + 1:
-            guard = leading_guard(fn)
-            if guard:
-                pos, param, mask = guard
-                if param in args or param in [a.arg for a in fn.args.kwonlyargs]:
-                    fn.body.pop(pos)
-                    rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, param, mask, "guard"))
-        defaults = fn.args.defaults
-        if defaults and len(defaults) == len(prior.args.defaults):
-            for i, before in enumerate(prior.args.defaults):
-                after = defaults[i]
-                if (isinstance(before, ast.Constant) and before.value is None
-                        and isinstance(after, ast.Constant) and type(after.value) is bool):
-                    defaults[i] = before
-                    rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, args[i-len(defaults)], 1, "default"))
+        if guard:
+            pos, param, mask = guard
+            if param in args or param in [a.arg for a in fn.args.kwonlyargs]:
+                fn.body.pop(pos)
+                rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, param, mask, "guard"))
+        for i in changes:
+            defaults[i] = prior.args.defaults[i]
+            rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno,
+                          args[i-len(defaults)], 1, "default"))
     return rules if rules and same(old, new) else None
 
 
@@ -88,6 +90,7 @@ def evidence(number):
 class PatchProof:
     def __init__(self, analyzer, patch, isolated_tests=()):
         self.files = {}
+        self.classified = {}
         self.analyzer = analyzer
         for path, new in changes(analyzer.base, patch).items():
             if path in isolated_tests:
@@ -98,15 +101,12 @@ class PatchProof:
                 break
             self.files[path] = (base.read_bytes(), new)
 
-    @functools.cached_property
-    def rules(self):
-        return {p: entry_edits(self.analyzer.old_tree_and_lines(p)[0], ast.parse(new))
-                for p, (_, new) in self.files.items()}
-
-    @functools.cached_property
-    def identity(self):
-        return {p: identity_edits(self.analyzer.old_tree_and_lines(p)[0], ast.parse(new))
-                for p, (_, new) in self.files.items()}
+    def classify(self, path, rule):
+        key = (path, rule)
+        if key not in self.classified:
+            original, _ = self.analyzer.old_tree_and_lines(path)
+            self.classified[key] = rule(original, ast.parse(self.files[path][1]))
+        return self.classified[key]
 
     def witness(self, number):
         if not self.files:
@@ -118,11 +118,11 @@ class PatchProof:
                 return None
             if path not in loaded:
                 return None
-            sites = self.identity[path]
+            sites = self.classify(path, identity_edits)
             if sites and all(f"{path}:{site}" in comparisons for site in sites):
                 reasons.add("identity")
                 continue
-            rules = self.rules[path]
+            rules = self.classify(path, entry_edits)
             if not rules:
                 return None
             module = path[:-3].replace("/", ".").removesuffix(".__init__")
