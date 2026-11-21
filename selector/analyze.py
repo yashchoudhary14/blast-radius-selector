@@ -26,7 +26,7 @@ from .core_headers import (inert_header, only_nested_definitions, private_consta
 from .dialect_cases import isolated_test_methods
 from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
-from .fixture_cases import unaffected_fixture_tests
+from .fixture_cases import TPC_DS, TPC_H, fixture_case_subsets, unaffected_fixture_tests
 from .memory_edits import same_memory_workload
 from .operands import narrow
 from .parser_payload import unchanged_limit_assertions
@@ -893,9 +893,16 @@ class Analyzer:
                                   p.startswith("sqlglot/") and p.endswith(".py")
                                   and p != "sqlglot/__main__.py" and data is not None
                                   and (self.base / p).is_file()) for p, data in edits.items())) else None
+        tpc_fixtures = []
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
+            created = new is not None and not (self.base / path).is_file()
+            if path in (TPC_DS, TPC_H) and not created and new is not None and readers:
+                mode = (self.base / path).stat().st_mode & 0o777
+                if edits.modes.get(path, mode) == mode:
+                    tpc_fixtures.append((path, readers))
+                    continue
             dialect_test = path.startswith("tests/dialects/") and p.match("test_*.py")
             out.direct |= readers
             out.priority |= readers
@@ -1060,14 +1067,27 @@ class Analyzer:
                     out.direct &= ~omit
                     out.broad &= ~omit
                     out.priority &= ~omit
+        other_mask = out.mask
+        for path, readers in tpc_fixtures:
+            out.direct |= readers
+            out.priority |= readers
+            if readers & memory_bit:
+                out.dialect_subset_safe = False
+            if shared_edit:
+                out.query_blocked |= readers
+            out.query_spans[path] = None
         if not out.broken and not out.structural:
-            omit = unaffected_fixture_tests(self, edits)
+            omit = unaffected_fixture_tests(self, edits, other_mask=other_mask)
             if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
+        if not out.broken and not out.structural and tpc_fixtures:
+            for number, indices in fixture_case_subsets(self, edits, other_mask=other_mask).items():
+                if number in self.queries.maps and out.mask & (1 << number):
+                    out.query_subsets[number] = indices
         number = self.num.get(MAX_NODES)
         if (not out.broken and not out.structural and number in self.queries.maps
                 and out.mask & ~out.query_blocked & (1 << number)
