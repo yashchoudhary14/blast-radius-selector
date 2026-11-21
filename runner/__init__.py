@@ -204,6 +204,7 @@ class Session:
             try:
                 self._warm = WarmParents(self._root, self.base, self.seconds, _enter_tree,
                                          {"tests": _fork_run, "state": _fork_state})
+                print(f"lane_preload_cpu={self._warm.preload_cpu:.6f}", file=sys.stderr, flush=True)
             except (OSError, EOFError) as exc:
                 print(f"runner preload failed: {exc!r}", file=sys.stderr)
                 self.warm_fixtures = False
@@ -212,6 +213,7 @@ class Session:
         return self._warm.preload_cpu if self._warm else 0.
 
     def import_stage(self, paths):
+        self.warm()
         return self._warm.stage(paths) if self._warm else -1
 
     def import_state(self, edits, deadline):

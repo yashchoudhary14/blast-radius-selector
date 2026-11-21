@@ -35,8 +35,6 @@ def lane(execution, millis, patches, output, start, deadline, static, fallback):
                 runner = stack.enter_context(Session())
             return runner
 
-        if not static:
-            log(f"lane_preload_cpu={session().warm():.6f}")
         slot = (deadline - start) / len(patches)
         for position, path in enumerate(patches):
             now = time.monotonic()

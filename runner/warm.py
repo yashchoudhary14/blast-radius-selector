@@ -4,6 +4,7 @@ A snapshot predating the first import of every changed file also predates its
 importers and all its registry/cache writes, including writes to older modules.
 Later stages live in descendants, so none of their mutations can travel back.
 """
+import gc
 import importlib
 import json
 import os
@@ -67,6 +68,7 @@ def serve_stages(channels, root, base, tests, enter, operations):
             cpu = time.process_time() - started
             conn = channels[index]
             conn.send((files, cpu))
+            gc.freeze()
             if index + 1 < len(channels):
                 child = os.fork()
                 if not child:
