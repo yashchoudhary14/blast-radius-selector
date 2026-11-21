@@ -1,5 +1,6 @@
 """Compare measured runner CPU with the marginal cost of the emitted worker schedule."""
 
+import os
 import time
 from collections import defaultdict
 
@@ -86,7 +87,8 @@ class Execution:
         def conservative(remaining):
             # A pending failure can affect heap measurements in the full suite.
             # A passing probe only settles the methods it actually completed.
-            if remaining - potential_observers:
+            # Variant: no suite-wide heap observers (SELECTOR_SUITE_OBSERVERS=1 restores them).
+            if os.getenv("SELECTOR_SUITE_OBSERVERS") == "1" and remaining - potential_observers:
                 return remaining | potential_observers
             return remaining
 
@@ -165,7 +167,7 @@ class Execution:
                                        stop_on_first_fail=early or bool(filters), overall_timeout=budget)
             bad = {self.num[node] for node in result.failing}
             failed.update(bad)
-            if bad:
+            if bad and os.getenv("SELECTOR_SUITE_OBSERVERS") == "1":
                 protected.update(potential_observers)
             if result.import_error:
                 include_importers()
