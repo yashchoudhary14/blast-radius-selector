@@ -71,6 +71,43 @@ def unchanged(rule, vectors, bounds):
     return all((v >> 10) & required == required and (v & required) in (0, required) for v in vectors)
 
 
+def inserted_guard(old, new):
+    if not isinstance(old, ast.FunctionDef) or not isinstance(new, ast.FunctionDef):
+        return None
+    if len(old.body) + 1 != len(new.body):
+        return None
+    pos = int(ast.get_docstring(old, clean=False) is not None)
+    stmt = new.body[pos]
+    if not isinstance(stmt, ast.If) or stmt.orelse or len(stmt.body) != 1:
+        return None
+    stop = stmt.body[0]
+    if isinstance(stop, ast.Return):
+        if stop.value is not None and not isinstance(stop.value, ast.Constant):
+            return None
+    elif isinstance(stop, ast.Raise) and stop.cause is None:
+        call = stop.exc
+        if call is not None and not isinstance(call, ast.Name) and not (
+                isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and not call.keywords
+                and all(isinstance(arg, ast.Constant) for arg in call.args)):
+            return None
+    else:
+        return None
+    if any(ast.dump(a) != ast.dump(b) for a, b in zip(old.body, new.body[:pos] + new.body[pos + 1:])):
+        return None
+    test = stmt.test
+    if isinstance(test, ast.Name):
+        return test.id, 8
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Name):
+        return test.operand.id, 4
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], (ast.Is, ast.IsNot)):
+        a, b = test.left, test.comparators[0]
+        if isinstance(a, ast.Constant):
+            a, b = b, a
+        if isinstance(a, ast.Name) and isinstance(b, ast.Constant) and b.value is None:
+            return a.id, 2 if isinstance(test.ops[0], ast.Is) else 1
+    return None
+
+
 @lru_cache(maxsize=4)
 def archive(file):
     return ZipFile(file)
@@ -81,10 +118,24 @@ def member(file, name):
     return marshal.loads(archive(file).read(name))
 
 
-def narrow(maps, path, old, new, mask, line_hits):
+def guard_candidates(file, path, old, new, mask, same_layout):
+    if not file.is_file() or path not in archive(file).NameToInfo:
+        return mask
+    rule = inserted_guard(old, new)
+    if not rule or not same_layout():
+        return mask
+    param, required = rule
+    key = old.lineno, old.col_offset, "entry", param
+    for vectors, _, tests in member(file, path).get(key, ()):
+        if tests & mask and all(fact & required for fact in vectors):
+            mask &= ~tests
+    return mask
+
+
+def narrow(maps, path, old, new, mask, line_hits, same_layout):
     rules = edits(old, new)
     if not rules:
-        return mask
+        return guard_candidates(maps / "parameters.zip", path, old, new, mask, same_layout)
     file = maps / "operands.zip"
     if not file.is_file() or path not in archive(file).NameToInfo:
         return mask

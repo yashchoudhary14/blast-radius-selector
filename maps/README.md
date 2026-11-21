@@ -19,6 +19,8 @@ docker cp br-r-operands:/tmp/operands.zip entry-wt-r/maps/operands.zip
 docker rm br-r-operands
 ```
 
+`parameters.zip` uses the same collection and packing steps with `-e BR_PARAMETER_BUILD=1` added to `docker run`. Copy the resulting archive to `maps/parameters.zip`. Each entry site describes None and truthiness observations for one parameter. The selector uses it for a leading return or raise guard whose predicate is always false in both runs.
+
 To regenerate the query map, run this from the track directory. Use an empty cache for a fresh collection. The builder runs each fixture separately, then traces the intact loop including pool workers. It assigns shared setup, teardown and unattributed full-run lines to every fixture.
 
 ```powershell

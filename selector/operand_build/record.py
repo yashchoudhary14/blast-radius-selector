@@ -162,7 +162,16 @@ def boolean(key, left, is_name, arg, condition):
     return left
 
 
+def entry(start, *values):
+    for key, value in enumerate(values, start):
+        fact = 1 if value is None else 2
+        if pure_truth(value):
+            fact |= 4 if value else 8
+        vectors[key].add(fact)
+
+
 def install():
     builtins._br_operand_compare = compare
     builtins._br_operand_boolean = boolean
     builtins._br_operand_mark = mark
+    builtins._br_operand_entry = entry

@@ -431,7 +431,8 @@ class Analyzer:
                             stmt_mask |= l_hits.get(ln, 0)
                     if stmt_mask and operand_safe:
                         stmt_mask = ((stmt_mask & self.index["heap_observers"]) |
-                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits))
+                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits,
+                                            lambda: pinned_layout(self.base, path) == frame_layout(compiled)))
                     out.direct |= stmt_mask
                 else:
                     out.direct |= hits.get(q, 0)

@@ -3,6 +3,7 @@ import ast
 import importlib._bootstrap_external as bootstrap
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 OPS = ("Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot", "In", "NotIn")
@@ -61,14 +62,37 @@ class Rewrite(ast.NodeTransformer):
         return node
 
 
+class Entries(ast.NodeTransformer):
+    def __init__(self, path, sites, tree):
+        self.path, self.sites = path, sites
+
+    def visit_FunctionDef(self, node):
+        if node.name.startswith("__") and node.name.endswith("__"):
+            return node
+        self.generic_visit(node)
+        args = node.args
+        params = [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+        params.extend(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+        if not params:
+            return node
+        start = len(self.sites)
+        self.sites.extend((self.path, node.lineno, node.col_offset, "entry", param) for param in params)
+        pos = int(ast.get_docstring(node, clean=False) is not None)
+        location = node.body[pos] if pos < len(node.body) else node.body[-1]
+        observer = call("entry", location, ast.Constant(start), *(ast.Name(p, ast.Load()) for p in params))
+        node.body.insert(pos, ast.copy_location(ast.Expr(observer), location))
+        return node
+
+
 def prepare():
     sites = []
     root = Path("/sqlglot")
+    instrument = Entries if os.environ.get("BR_PARAMETER_BUILD") else Rewrite
     for file in sorted((root / "sqlglot").rglob("*.py")):
         data = file.read_bytes()
         assert b"_br_operand_" not in data
         tree = ast.parse(data, str(file))
-        Rewrite(file.relative_to(root).as_posix(), sites, tree).visit(tree)
+        instrument(file.relative_to(root).as_posix(), sites, tree).visit(tree)
         code = compile(ast.fix_missing_locations(tree), str(file), "exec", dont_inherit=True)
         cache = Path(importlib.util.cache_from_source(str(file)))
         cache.parent.mkdir(exist_ok=True)
