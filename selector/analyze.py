@@ -189,6 +189,29 @@ def numbers(mask):
         mask ^= low
 
 
+def collection_actions(source):
+    """Find statements that can write shared state while a test module imports."""
+    if source is None:
+        return ()
+    try:
+        body = ast.parse(source).body
+    except (SyntaxError, ValueError):
+        return ()
+
+    def writes(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        if isinstance(node, ast.Expr):
+            return any(isinstance(expr, ast.Call) for expr in ast.walk(node.value))
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            return isinstance(node.ctx, (ast.Store, ast.Del))
+        if isinstance(node, ast.Name):
+            return node.id == "pytest_plugins" and isinstance(node.ctx, (ast.Store, ast.Del))
+        return any(writes(child) for child in ast.iter_child_nodes(node))
+
+    return tuple(ast.dump(stmt) for stmt in body if writes(stmt))
+
+
 class Analyzer:
     def __init__(self, manifest, base=Path("/sqlglot"), maps=Path("/app/maps")):
         self.base, self.maps = base, maps
@@ -319,13 +342,14 @@ class Analyzer:
         return mask
 
     def _pytest_config(self, p, new):
-        """Config files pytest discovers from the rootdir or from tests/ upward (probe adv: filterwarnings)."""
-        if p.name not in ("pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"):
+        """Config files pytest discovers for the test tree."""
+        dedicated = {"pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml"}
+        if p.name not in dedicated | {"tox.ini", "setup.cfg", "pyproject.toml"}:
             return False
         parent = p.parent.as_posix()
         if parent not in (".", "") and parent != "tests" and not parent.startswith("tests/"):
             return False
-        if p.name in ("pytest.ini", ".pytest.ini"):
+        if p.name in dedicated:
             return True
         old = (self.base / p).read_bytes() if (self.base / p).is_file() else b""
         return b"pytest" in old.lower() or b"pytest" in (new or b"").lower()
@@ -384,12 +408,20 @@ class Analyzer:
                 out.python_paths.append(path)
                 if not path.startswith("sqlglot/"):
                     out.dialect_subset_safe = False
-                if p.name == "conftest.py":
-                    # Pytest loads conftest hooks for every method below the directory.
-                    for file, mask in self.file_tests.items():
-                        if Path(file).is_relative_to(p.parent):
-                            out.broad |= mask
-                    out.broken = True  # unittest probes do not execute pytest hooks.
+                if p.name == "conftest.py" and (p.parent == Path(".") or p.parts[0] == "tests"):
+                    # Even a nested conftest can change the entire item list.
+                    out.broad |= self.all_tests
+                    out.broken = True
+                    continue
+                if path.startswith("tests/") and (p.match("test_*.py") or p.match("*_test.py")
+                                                  or self.importers[path]):
+                    before = None if created else (self.base / path).read_bytes()
+                    if collection_actions(before) != collection_actions(new):
+                        # Shared changes during full-suite collection are invisible to
+                        # probes that import only the test modules they execute.
+                        out.broad |= self.all_tests
+                        out.broken = True
+                        continue
                 if created:
                     lookup = p.parent.as_posix() + ".py" if p.name == "__init__.py" else path
                     out.broad |= self.index["missing_imports"].get(lookup, 0)
