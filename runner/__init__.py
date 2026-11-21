@@ -15,6 +15,7 @@ from pathlib import Path
 from .cases import GENERATOR_MEMORY, execute
 from .overlay import PatchError, changes, populate
 from .process import child_pipe
+from .query_cases import QUERIES
 from .warm import WarmParents, project_modules
 
 
@@ -207,8 +208,8 @@ class Session:
         try:
             edits = changes(self.base, patch_text)
             ids = list(dict.fromkeys(test_ids))
-            if case_filter and set(case_filter) - ({GENERATOR_MEMORY} & set(ids)):
-                raise ValueError("case filters require a selected generator-memory test")
+            if case_filter and set(case_filter) - ((QUERIES.keys() | {GENERATOR_MEMORY}) & set(ids)):
+                raise ValueError("case filter requires a supported, selected test")
             if not ids:
                 return RunResult()
             self.warm()

@@ -16,6 +16,7 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
+from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -161,10 +162,15 @@ class Candidates:
     broken: bool = False
     python_paths: list[str] = field(default_factory=list)
     dialect_subset_safe: bool = True
+    query_spans: dict | None = field(default_factory=dict)
+    query_subsets: dict = field(default_factory=dict)
 
     @property
     def mask(self):
         return self.direct | self.broad
+
+    def selected(self):
+        return set(numbers(self.mask)) - {n for n, indices in self.query_subsets.items() if not indices}
 
 
 def numbers(mask):
@@ -181,6 +187,7 @@ class Analyzer:
         self.tests = json.loads(manifest.read_bytes())["tests"]
         self.ids = {t["number"]: t["id"] for t in self.tests}
         self.num = {i: n for n, i in self.ids.items()}
+        self.queries = QueryCases(self)
         self.file_tests, self.class_tests, self.methods = (defaultdict(int) for _ in range(3))
         metadata = self.index["dialect_mentions"]
         for t in self.tests:
@@ -290,9 +297,13 @@ class Analyzer:
 
     def analyze(self, patch, *, prioritize=False):
         out = Candidates()
-        for path, new in changes(self.base, patch).items():
+        edits = changes(self.base, patch)
+        for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
+            if new is None or not (path.startswith("sqlglot/") and p.suffix == ".py"
+                                   and (self.base / path).is_file()):
+                out.query_spans = None
             out.direct |= readers
             out.priority |= readers
             if new is None or not (self.base / path).exists():
@@ -306,6 +317,7 @@ class Analyzer:
                 if not path.startswith("sqlglot/"):
                     out.dialect_subset_safe = False
                 self.python(path, new, out, prioritize=prioritize)
+        out.query_subsets = self.queries.subsets(out, edits)
         return out
 
     def python(self, path, new, out, *, prioritize=False):
@@ -314,7 +326,7 @@ class Analyzer:
             if new is None:
                 raise SyntaxError("deleted module")
             # ast.parse alone accepts constructs such as return outside a function.
-            compile(new, path, "exec", dont_inherit=True)
+            compiled = compile(new, path, "exec", dont_inherit=True)
             tree = ast.parse(new, path)
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
@@ -336,6 +348,8 @@ class Analyzer:
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
         scope_edit = bool(dirty)
+        if old_scopes != new_scopes or old_funcs.keys() != new_funcs.keys():
+            out.query_spans = None
         if dirty:
             # Class/module-level edits that sit entirely inside lambda bodies (e.g. entries of
             # Parser.FUNCTIONS / Generator.TRANSFORMS dicts) are code, not data: a lambda body runs
@@ -366,6 +380,12 @@ class Analyzer:
                 fn_old = _get_func_node(old_tree, q)
                 fn_new = _get_func_node(new_tree_for_stmts, q)
                 spans = _changed_stmt_spans(fn_old, old_lines, new.splitlines(), fn_new)
+                if out.query_spans is not None:
+                    safe = body_spans(fn_old, fn_new, spans)
+                    if safe:
+                        out.query_spans.setdefault(path, []).extend(safe)
+                    else:
+                        out.query_spans = None
                 l_hits = self.line_hits(path)
                 if spans and l_hits:
                     stmt_mask = 0
@@ -386,6 +406,7 @@ class Analyzer:
                 same = self.index["by_name"].get(method.split("#")[0], 0)
                 out.broad |= (same & runtime) or same
             if old and revised and old[1] != revised[1]:
+                out.query_spans = None
                 dirty.add(owner)
             if old and not revised and not owner:
                 # A removed binding can break a from-import in a test that
@@ -398,6 +419,9 @@ class Analyzer:
                 if method in {"setUp", "tearDown", "setUpClass", "tearDownClass",
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
+        if (out.query_spans and path in out.query_spans
+                and pinned_layout(self.base, path) != frame_layout(compiled)):
+            out.query_spans = None
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
         import_rows = self.indirect_hits.get(path)
@@ -480,7 +504,7 @@ def main():
     for patch in sorted((args.dataset / "commits").glob("*.patch")):
         try:
             result = analyzer.analyze(patch.read_bytes().decode("utf-8", "surrogateescape"))
-            candidates = list(numbers(result.mask))
+            candidates = sorted(result.selected())
         except Exception as e:
             print(f"fallback {patch.stem} {e!r}", file=sys.stderr)
             candidates = list(analyzer.ids)

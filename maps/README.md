@@ -9,6 +9,13 @@ These files describe the numbered tests at SQLGlot commit `eb11aec4be8cb2122afe7
 | `modlevel.json.gz` | `{"path.py":[line,...],...}`. Sorted lines reached while importing the pinned files in module and class definition scopes. Includes executed decorators, default expressions and definition lines. An empty list is valid. |
 | `reads.json.gz` | `{"path":[test_number,...],...}`. Each sorted list identifies tests that opened an existing file under the checkout with read access, including Python sources opened as data. |
 | `durations.json` | `{"test_number":[wall_seconds,process_cpu_seconds],...}`. Each pair measures the complete pytest protocol in a separate serial run. Wall time includes waiting for child processes. Process CPU measures the pytest process, including its threads. |
+| `query_cases.json.gz` | Each test ID maps to a fixture count, a table of integer case masks, and a per-file list of inclusive `[first_line, last_line, mask_index]` ranges. Bit zero is the first fixture. The parser limit test has one bit for its complete method. |
+
+To regenerate the query map, run this from the track directory. Use an empty cache for a fresh collection. The builder runs each fixture separately, then traces the intact loop including pool workers. It assigns shared setup, teardown and unattributed full-run lines to every fixture.
+
+```powershell
+docker run --rm --cpus=4 -e PYTHON_CPU_COUNT=1 -e OPENBLAS_NUM_THREADS=1 -e PYTHONPATH=/app/selector/query_build:/app:/sqlglot -v "${PWD}/entry:/app" -v "${PWD}/scratch/m/cache:/query-cache" br-lab python /app/selector/query_build/build.py
+```
 
 ## Rebuild
 

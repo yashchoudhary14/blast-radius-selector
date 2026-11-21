@@ -7,6 +7,8 @@ from collections import defaultdict
 from functools import wraps
 from itertools import groupby
 
+from .query_cases import filter_queries
+
 
 GENERATOR_MEMORY = "tests/test_generator.py::TestGenerator::test_generator_memory"
 
@@ -188,7 +190,10 @@ def execute(ids, deadlines, early, send, case_filter=None):
                     continue
                 case._runner_index = idx
                 if case_filter and ids[idx] in case_filter:
-                    filter_dialects(case, imported, case_filter[ids[idx]])
+                    if ids[idx] == GENERATOR_MEMORY:
+                        filter_dialects(case, imported, case_filter[ids[idx]])
+                    else:
+                        filter_queries(case, imported, ids[idx], case_filter[ids[idx]])
                 klass = type(case)
                 result.by_scope[klass.__module__].append(idx)
                 result.by_scope[f"{klass.__module__}.{klass.__qualname__}"].append(idx)

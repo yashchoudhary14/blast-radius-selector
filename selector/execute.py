@@ -71,7 +71,11 @@ class Execution:
         yield from groups.values()
 
     def select(self, get_session, commit, patch, candidates, deadline, log):
-        selected = set(numbers(candidates.mask))
+        selected = candidates.selected()
+        subsets = candidates.query_subsets
+        for n, indices in subsets.items():
+            if not indices:
+                log(f"queries {commit} n={n} cases=0 outcome=pass")
         if not selected or candidates.broken:
             return selected
         failed, observed = set(), set()
@@ -94,6 +98,12 @@ class Execution:
             return selected
         stage = get_session().import_stage(candidates.python_paths)
         self.import_cpu = {2: 0., 1: .025, 0: .065, -1: .15}[stage]
+        discounts = {n: self.body[n] - self.analyzer.queries.body_cost(n, indices, self)
+                     for n, indices in subsets.items() if indices}
+
+        def run_cost(batch):
+            return self.run_cost(batch) - sum(discounts[n] for n in discounts if n in batch)
+
         subset = self.dialects.subset(candidates) if self.memory is not None else None
         if subset is not None:
             subset_cost = self.import_cpu + self.setup({self.memory}) + .12 * len(subset)
@@ -142,7 +152,7 @@ class Execution:
 
         def rank(n):
             level = 0 if candidates.priority & (1 << n) else 1 if candidates.direct & (1 << n) else 2
-            return level, self.run_cost([n]), n
+            return level, run_cost([n]), n
 
         def run(batch, early):
             order = sorted(batch, key=rank)
@@ -150,8 +160,9 @@ class Execution:
             budget = deadline - time.monotonic()
             if budget <= 0:
                 return False
-            result = get_session().run(patch, [self.ids[n] for n in order],
-                                       stop_on_first_fail=early, overall_timeout=budget)
+            filters = {self.ids[n]: subsets[n] for n in batch if n in discounts}
+            result = get_session().run(patch, [self.ids[n] for n in order], case_filter=filters,
+                                       stop_on_first_fail=early or bool(filters), overall_timeout=budget)
             bad = {self.num[node] for node in result.failing}
             failed.update(bad)
             if bad:
@@ -160,6 +171,11 @@ class Execution:
                 include_importers()
             complete = "incomplete child run" not in result.notes
             ran = {self.num[node] for node in result.ran}
+            for n in ran & discounts.keys():
+                outcome = "unknown" if result.notes else "fail" if n in bad else "pass"
+                if outcome == "unknown":
+                    protected.add(n)
+                log(f"queries {commit} n={n} cases={len(subsets[n])} outcome={outcome}")
             if complete and not result.import_error:
                 observed.update(ran)
                 selected.difference_update(ran - bad)
@@ -195,15 +211,15 @@ class Execution:
                 if not key or key in seen:
                     continue
                 seen.add(key)
-                estimate = self.run_cost(batch)
+                estimate = run_cost(batch)
                 if estimate > budget:
                     continue
                 gain = static - self.cost(conservative(selected - batch))
-                if failed:
+                if failed or (len(batch) == 1 and batch & discounts.keys()):
                     net = gain - estimate
                 else:
                     first = min(batch, key=rank)
-                    net = pass_chance * (gain - estimate) - (1 - pass_chance) * self.run_cost([first])
+                    net = pass_chance * (gain - estimate) - (1 - pass_chance) * run_cost([first])
                 if net > margin:
                     margin, best = net, batch
 
@@ -233,7 +249,7 @@ class Execution:
 
             if best is None:
                 break
-            log(f"decision {commit} batch={len(best)}/{len(pending)} est={self.run_cost(best):.3f} "
+            log(f"decision {commit} batch={len(best)}/{len(pending)} est={run_cost(best):.3f} "
                 f"gain={static-self.cost(conservative(selected-best)):.3f} early={int(not failed)} budget={budget:.2f}")
             root = None  # Session.run removes its overlay.
             if not run(best, not failed):
