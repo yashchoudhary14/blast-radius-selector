@@ -782,11 +782,7 @@ class Analyzer:
             kind, owner, is_plain, relocated = doc_res
             loc = self.location_observers() if relocated else 0
             if is_plain:
-                mask = self.doc_observers() | loc
-                # H2 also handles same-height module and plain top-level class docs.
-                if not relocated and (kind == "module" or (kind == "class" and "." not in owner)):
-                    mask |= self.state_refs.mask("*") | self.state_refs.mask("*sqlvalue")
-                return mask
+                return self.doc_observers() | loc
             if kind == "class" and path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
                 return self.doc_observers() | loc
             if kind == "class" and probe is not None:
