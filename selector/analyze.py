@@ -160,6 +160,7 @@ class Candidates:
     broad: int = 0
     priority: int = 0
     broken: bool = False
+    structural: bool = False
     python_paths: list[str] = field(default_factory=list)
     dialect_subset_safe: bool = True
     query_spans: dict | None = field(default_factory=dict)
@@ -298,6 +299,8 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False):
         out = Candidates()
         edits = changes(self.base, patch)
+        for directory in edits.removed_dirs:
+            out.broad |= self.index["dirs"].get(Path(directory).parent.as_posix(), 0)
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
@@ -306,16 +309,41 @@ class Analyzer:
                 out.query_spans = None
             out.direct |= readers
             out.priority |= readers
-            if new is None or not (self.base / path).exists():
+            created = new is not None and not (self.base / path).is_file()
+            if new is None or created:
+                out.structural = True
                 out.dialect_subset_safe = False
                 directory = p.parent
                 while not (self.base / directory).is_dir():
+                    out.broad |= self.index["missing_imports"].get(directory.as_posix() + ".py", 0)
                     directory = directory.parent
                 out.broad |= self.index["dirs"].get(directory.as_posix(), 0)
             if p.suffix == ".py":
                 out.python_paths.append(path)
                 if not path.startswith("sqlglot/"):
                     out.dialect_subset_safe = False
+                if p.name == "conftest.py":
+                    # Pytest loads conftest hooks for every method below the directory.
+                    for file, mask in self.file_tests.items():
+                        if Path(file).is_relative_to(p.parent):
+                            out.broad |= mask
+                    out.broken = True  # unittest probes do not execute pytest hooks.
+                if created:
+                    lookup = p.parent.as_posix() + ".py" if p.name == "__init__.py" else path
+                    out.broad |= self.index["missing_imports"].get(lookup, 0)
+                    if p.name == "__init__.py":
+                        # A new package takes precedence over a sibling module of the same name.
+                        out.broad |= self.importers[lookup] | self.index["all_hits"].get(lookup, 0)
+                        # Imports through an existing namespace now execute its initializer.
+                        prefix = p.parent.as_posix() + "/"
+                        for module, mask in self.importers.items():
+                            if module.startswith(prefix):
+                                out.broad |= mask
+                    continue
+                if not path.startswith(("tests/", "sqlglot/")):
+                    # Packaging scripts and examples may be read or executed by path.
+                    out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
+                    continue
                 self.python(path, new, out, prioritize=prioritize)
         out.query_subsets = self.queries.subsets(out, edits)
         return out

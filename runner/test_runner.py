@@ -80,6 +80,39 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(self.session.run("", ids).failing, set(ids))
             self.assertIs(sys.modules["tests.mod"], inherited)
 
+    def test_git_renames_and_modes(self):
+        directory = self.base / "a"
+        directory.mkdir()
+        self.put("a/old name", "old\n")
+        patch = ("diff --git a/a/old name b/new name\nsimilarity index 100%\n"
+                 "rename from a/old name\nrename to new name\n")
+        root = self.session.apply_only(patch)
+        self.assertFalse((root / "a").exists())
+        self.assertEqual((root / "new name").read_bytes(), b"old\n")
+        root = self.session.apply_only(patch.replace("rename ", "copy "))
+        self.assertEqual((root / "a/old name").read_bytes(), (root / "new name").read_bytes())
+        hunk = "--- a/a/old name\n+++ b/new name\n@@ -1 +1 @@\n-old\n+new\n"
+        root = self.session.apply_only(patch.replace("100%", "50%") + hunk)
+        self.assertEqual((root / "new name").read_bytes(), b"new\n")
+        mode = "diff --git a/a/old name b/a/old name\nold mode 100644\nnew mode 100755\n"
+        root = self.session.apply_only(mode)
+        self.assertEqual((root / "a/old name").stat().st_mode & 0o777, 0o755)
+        self.assertFalse((directory / "old name").stat().st_mode & 0o111)
+
+    def test_empty_files_and_binary(self):
+        patch = "diff --git a/tests/empty b/tests/empty\nnew file mode 100755\nindex 0000000..e69de29\n"
+        root = self.session.apply_only(patch)
+        self.assertEqual((root / "tests/empty").read_bytes(), b"")
+        self.assertEqual((root / "tests/empty").stat().st_mode & 0o777, 0o755)
+        self.put("tests/empty", "")
+        with self.assertRaises(PatchError):
+            self.session.apply_only(patch)
+        root = self.session.apply_only(patch.replace("new file", "deleted file"))
+        self.assertFalse((root / "tests/empty").exists())
+        for marker in ("Binary files a/blob and b/blob differ", "GIT binary patch"):
+            with self.assertRaisesRegex(PatchError, marker):
+                self.session.apply_only("diff --git a/blob b/blob\n" + marker + "\n")
+
     def test_fixture_and_method_outcomes(self):
         self.put("tests/bad.py", "raise ImportError('missing')\n")
         self.put("tests/cases.py", """

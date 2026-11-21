@@ -4,6 +4,18 @@ import os
 import sys
 
 
+class MissingModules:
+    """Last finder in the baseline interpreter. A new source file could satisfy this lookup."""
+
+    def __init__(self, record):
+        self.record = record
+
+    def find_spec(self, fullname, path, target=None):
+        if path is None or any(p.startswith("/sqlglot/") for p in path):
+            self.record(fullname.replace(".", "/") + ".py")
+        return None
+
+
 def install():
     sink = os.environ.get("BR_AUDIT_LOG")
     if not sink:
@@ -56,6 +68,13 @@ def record_child_imports():
         return
     fd = os.open(sink, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     seen = set()
+
+    def missing(path):
+        if path not in seen:
+            seen.add(path)
+            os.write(fd, (path + "\n").encode())
+
+    sys.meta_path.append(MissingModules(missing))
 
     def audit(event, args):
         if event != "exec":

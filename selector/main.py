@@ -58,7 +58,7 @@ def lane(execution, millis, patches, output, start, deadline, static, fallback):
                 workers, cost = schedule(selected, millis)
                 # For a broad static selection the largest indivisible test
                 # can already set the full-catalog price.
-                if cost >= all_cost:
+                if cost >= all_cost and not candidates.structural:
                     selected.update(n for n in millis if not candidates.mask & (1 << n))
                     workers = [[n for n in w if n in selected] for w in all_workers]
                     workers = [w for w in workers if w]

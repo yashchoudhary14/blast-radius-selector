@@ -5,7 +5,6 @@ import gzip
 import json
 import marshal
 from collections import defaultdict
-from pathlib import PurePosixPath
 
 from .collect import BASE, MAPS
 from .scopes import snapshot
@@ -63,9 +62,6 @@ def build():
     for path, ns in json.loads((MAPS / "import_only_reads.json").read_bytes()).items():
         reads[path] &= ~bits(ns)
     dirs = defaultdict(int)
-    for path, mask in reads.items():
-        for parent in PurePosixPath(path).parents:
-            dirs[str(parent)] |= mask
     for path, ns in json.loads((MAPS / "directory_reads.json").read_bytes()).items():
         dirs[path] |= bits(ns)
 
@@ -73,6 +69,7 @@ def build():
     class_usage = marshal.loads((MAPS / "class_usage").read_bytes()) if (MAPS / "class_usage").is_file() else {}
     index = dict(all_hits=all_hits, runtime=runtime, by_func=by_func, by_name=dict(by_name),
                  reads=reads, dirs=dict(dirs), heap_observers=bits(lazy["heap_observers"]),
+                 missing_imports={p: bits(ns) for p, ns in read_gz("missing_imports.json.gz").items()},
                  lazy_imports={p: bits(ns) for p, ns in lazy["imports"].items()},
                  class_usage=class_usage)
     for name in ("collect_imports", "collection_reads", "dialect_mentions", "durations"):

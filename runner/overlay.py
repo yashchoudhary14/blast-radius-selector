@@ -3,6 +3,7 @@
 import ast
 import os
 import re
+from pathlib import PurePosixPath
 
 
 class PatchError(ValueError):
@@ -13,13 +14,13 @@ HEADER = re.compile(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*|)$")
 NO_EOL = b"\\ No newline at end of file"
 
 
-def _path(raw):
+def _path(raw, *, prefix=True):
     raw = raw.split(b"\t", 1)[0]
     if raw == b"/dev/null":
         return None
     if raw.startswith(b'"'):
         raw = ast.literal_eval("b" + raw.decode("ascii"))
-    if raw.startswith((b"a/", b"b/")):
+    if prefix and raw.startswith((b"a/", b"b/")):
         raw = raw[2:]
     if any(part in (b"", b".", b"..") for part in raw.split(b"/")) or b"\0" in raw:
         raise PatchError(f"invalid patch path {raw!r}")
@@ -89,77 +90,140 @@ def _apply(lines, i, source, name):
     return b"".join(out), i
 
 
+class Edits(dict):
+    def __init__(self):
+        super().__init__()
+        self.modes = {}
+        self.removed_dirs = set()
+
+    def finish_deletions(self, base, removed):
+        for path in removed:
+            self.setdefault(path, None)
+        # Git tracks files, so removing the last file also removes the directory.
+        parents = {p for name in removed for p in PurePosixPath(name).parents if p.parts}
+        retained = {p for name, data in self.items() if data is not None
+                    for p in PurePosixPath(name).parents}
+        for parent in sorted(parents - retained, key=lambda p: -len(p.parts)):
+            if all(child.name == "__pycache__" or child.relative_to(base).as_posix() in removed
+                   or child.relative_to(base).as_posix() in self.removed_dirs
+                   for child in (base / parent).iterdir()):
+                self.removed_dirs.add(parent.as_posix())
+
+
+def _same_path(header):
+    # Git does not quote ordinary spaces. In a metadata-only section both
+    # names denote the same path, which disambiguates even an embedded " b/".
+    match = re.fullmatch(rb'a/(.+) b/\1', header)
+    if match:
+        return _path(b"a/" + match[1])
+    left, sep, right = header.partition(b'" "')
+    if sep and _path(left + b'"') == _path(b'"' + right):
+        return _path(left + b'"')
+    raise PatchError(f"invalid file header {header!r}")
+
+
 def changes(base, patch):
     raw = patch.encode("utf-8", "surrogateescape")
     if raw.partition(b"\n")[0].endswith(b"\r"):
         raw = raw.replace(b"\r\n", b"\n")
     lines = raw.split(b"\n")
-    edits = {}
+    edits = Edits()
+    removed = set()
+    destinations = set()
     i = 0
     while i < len(lines):
-        line = lines[i]
-        i += 1
-        if not line or line.startswith((b"index ", b"new file mode ", b"deleted file mode ")):
+        if not lines[i]:
+            i += 1
             continue
-        if line.startswith(b"diff --git "):
-            # Git omits ---/+++ for creation/deletion of an empty file.
-            if i < len(lines) and lines[i].startswith((b"new file mode ", b"deleted file mode ")):
-                j = i + 1
-                if j < len(lines) and lines[j].startswith(b"index "):
-                    j += 1
-                if j == len(lines) or not lines[j] or lines[j].startswith(b"diff --git "):
-                    left, sep, right = line[11:].rpartition(b" b/")
-                    if not sep or _path(left) != _path(b"b/" + right):
-                        raise PatchError("unsupported empty file header")
-                    path = _path(left)
-                    creating = lines[i].startswith(b"new")
-                    if creating == (base / path).exists() or (
-                        not creating and (base / path).stat().st_size
-                    ):
-                        raise PatchError(f"{path}: invalid empty file change")
-                    edits[path] = b"" if creating else None
-            continue
-        if not line.startswith(b"--- ") or i >= len(lines) or not lines[i].startswith(b"+++ "):
-            raise PatchError(f"unsupported patch header {line[:120]!r}")
-        old, new = _path(line[4:]), _path(lines[i][4:])
-        i += 1
-        if old is None and new is None:
+        header = None
+        meta = {}
+        if lines[i].startswith(b"diff --git "):
+            header = lines[i][11:]
+            i += 1
+            while i < len(lines) and lines[i] and not lines[i].startswith((b"diff --git ", b"--- ")):
+                key, _, value = lines[i].rpartition(b" ")
+                if lines[i].startswith((b"rename ", b"copy ")):
+                    operation, key, value = lines[i].split(b" ", 2)
+                    meta[b"operation"] = operation
+                    meta[key] = _path(value, prefix=False)
+                elif key in (b"old mode", b"new mode", b"new file mode", b"deleted file mode"):
+                    meta[key] = int(value, 8)
+                elif not lines[i].startswith((b"index ", b"similarity index ", b"dissimilarity index ")):
+                    raise PatchError(f"unsupported patch header {lines[i][:120]!r}")
+                i += 1
+
+        hunks = i < len(lines) and lines[i].startswith(b"--- ")
+        if hunks:
+            if i + 1 >= len(lines) or not lines[i + 1].startswith(b"+++ "):
+                raise PatchError("missing new file header")
+            old, new = _path(lines[i][4:]), _path(lines[i + 1][4:])
+            i += 2
+        elif b"from" in meta and b"to" in meta:
+            old, new = meta[b"from"], meta[b"to"]
+        elif header is not None and meta:
+            path = _same_path(header)
+            old = None if b"new file mode" in meta else path
+            new = None if b"deleted file mode" in meta else path
+        else:
+            raise PatchError(f"expected a file section near line {i + 1}")
+
+        if not (old or new):
             raise PatchError("missing file name")
         try:
-            if old is not None and not (base / old).resolve().is_relative_to(base):
-                raise PatchError(f"{old}: source outside base")
-            if old != new and new and (base / new).exists():
-                raise PatchError(f"{new}: target already exists")
-            if old in edits or new in edits:
-                raise PatchError("repeated file section")
+            if any(not (base / p).resolve().is_relative_to(base) for p in (old, new) if p):
+                raise PatchError("path outside checkout")
             source = (base / old).read_bytes() if old else b""
-            if i >= len(lines) or not lines[i].startswith(b"@@"):
-                raise PatchError(f"{new or old}: missing hunk")
-            result, i = _apply(lines, i, source, new or old)
-            if new is None and result:
+            result = source
+            if hunks:
+                if i >= len(lines) or not lines[i].startswith(b"@@"):
+                    raise PatchError(f"{new or old}: missing hunk")
+                result, i = _apply(lines, i, source, new or old)
+            if not new and result:
                 raise PatchError(f"{old}: incomplete deletion")
-            if old and old != new:
-                edits[old] = None
+            if old and old != new and meta.get(b"operation") != b"copy":
+                removed.add(old)
             if new:
+                if old != new:
+                    destinations.add(new)
+                if new in edits:
+                    raise PatchError(f"{new}: repeated destination")
                 edits[new] = result
+                if b"new mode" in meta or b"new file mode" in meta:
+                    edits.modes[new] = meta.get(b"new mode", meta.get(b"new file mode")) & 0o777
+                elif old:
+                    edits.modes[new] = (base / old).stat().st_mode & 0o777
         except OSError as exc:
             raise PatchError(str(exc)) from exc
+    if removed:
+        edits.finish_deletions(base, removed)
+    for path in destinations - removed - edits.removed_dirs:
+        if (base / path).exists():
+            raise PatchError(f"{path}: target already exists")
     return edits
 
 
 def populate(base, root, edits):
     # This pinned test resolves its own __file__ to locate sqlglotc/setup.py.
     # Give it an overlay inode if that script or its package changes.
+    modes = getattr(edits, "modes", {})
+    removed_dirs = getattr(edits, "removed_dirs", set())
     anchor = "tests/test_sqlglotc.py"
     if (any(p.startswith("sqlglotc/") for p in edits) and anchor not in edits
             and (base / anchor).is_file()):
         edits = {**edits, anchor: (base / anchor).read_bytes()}
     tree = {}
-    for name, data in edits.items():
+    # Place directory and file removals first so a new file may replace an
+    # entire directory, or become a child of a path that used to be a file.
+    deleted = removed_dirs | {p for p, data in edits.items() if data is None}
+    staged = dict.fromkeys(sorted(deleted, key=lambda p: -p.count("/")))
+    staged.update((p, data) for p, data in edits.items() if data is not None)
+    for name, data in staged.items():
         directory = tree
         *parents, leaf = name.split("/")
         for part in parents:
-            directory = directory.setdefault(part, {})
+            if directory.get(part) is None:
+                directory[part] = {}
+            directory = directory[part]
         directory[leaf] = data
 
     def visit(src, dst, entries):
@@ -183,5 +247,8 @@ def populate(base, root, edits):
                 visit(src / child, path, data)
             elif data is not None:
                 path.write_bytes(data)
+                mode = modes.get(path.relative_to(root).as_posix())
+                if mode is not None:
+                    path.chmod(mode)
 
     visit(base, root, tree)

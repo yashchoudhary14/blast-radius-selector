@@ -19,6 +19,13 @@ docker run --rm --cpus=4 -e PYTHON_CPU_COUNT=1 -e OPENBLAS_NUM_THREADS=1 -e PYTH
 
 ## Rebuild
 
+`selector.runtime_imports` also records failed baseline import lookups during collection, individual tests and their subprocesses. An added module or package can satisfy one of these names. Rebuild the optional-module map from the pinned test manifest using the selector image and a scratch output mount.
+
+```powershell
+docker run --rm --cpus=4 -e PYTHON_CPU_COUNT=1 -v "${PWD}/entry-wt-p/selector:/app/selector:ro" -v "${PWD}/scratch/p2:/app/maps" -v "${PWD}/sample/sample:/data:ro" -w /sqlglot br-p2 python -m selector.runtime_imports --jobs 4
+Copy-Item scratch/p2/missing_imports.json.gz entry-wt-p/maps/
+```
+
 With the pinned `br-lab` Docker image available, run this from the Blast Radius track directory in PowerShell.
 
 ```powershell

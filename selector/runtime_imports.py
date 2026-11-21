@@ -2,6 +2,7 @@
 
 import argparse
 import ast
+import gzip
 import importlib
 import json
 import os
@@ -14,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .collect import BASE, MAPS
+from .audit.sitecustomize import MissingModules
 
 
 def loaded_paths():
@@ -28,6 +30,8 @@ def loaded_paths():
 def measure_file(file, tests, output):
     # Run class/module fixtures afresh as well. A fork inherits only collection
     # imports, so another method cannot satisfy this method's lazy imports.
+    missing = set()
+    sys.meta_path.append(MissingModules(missing.add))
     module = importlib.import_module(file[:-3].replace("/", "."))
     initial = loaded_paths()
     measured = {}
@@ -48,7 +52,7 @@ def measure_file(file, tests, output):
                     unittest.TestSuite([case]).run(result)
                     if not result.wasSuccessful():
                         raise RuntimeError((result.errors + result.failures)[:1])
-                    output.write_text(json.dumps(sorted(loaded_paths() - initial)))
+                    output.write_text(json.dumps(sorted((loaded_paths() - initial) | missing)))
                 os._exit(0)
             except BaseException as exc:
                 print(f"{test['id']}: {exc!r}", file=sys.stderr, flush=True)
@@ -100,6 +104,9 @@ def build(tests, manifest, jobs):
     observers = set().union(*(observes_heap(file) for file in files))
     result = {"imports": {p: sorted(ns) for p, ns in imports.items()},
               "heap_observers": sorted(t["number"] for t in tests if t["id"] in observers)}
+    missing = {p: result["imports"].pop(p) for p in imports if not (BASE / p).exists()}
+    (MAPS / "missing_imports.json.gz").write_bytes(gzip.compress(
+        json.dumps(missing, sort_keys=True, separators=(",", ":")).encode(), mtime=0))
     (MAPS / "runtime_imports.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
 
 
