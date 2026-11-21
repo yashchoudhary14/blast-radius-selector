@@ -9,6 +9,7 @@ from runner.overlay import changes
 
 from .analyze import _header_span
 from .scopes import snapshot
+from .source_equivalence import _same_directives_text_only
 
 
 def same(left, right):
@@ -35,8 +36,15 @@ def leading_guard(fn):
 
 def entry_edits(old, new):
     """Undo supported edits, then compare the complete AST to catch any other edits."""
-    old_funcs = {f.name: f for f in old.body if isinstance(f, ast.FunctionDef)}
-    new_funcs = {f.name: f for f in new.body if isinstance(f, ast.FunctionDef)}
+    def functions(body, prefix=""):
+        for node in body:
+            if isinstance(node, ast.FunctionDef):
+                yield prefix + node.name, node
+            elif isinstance(node, ast.ClassDef):
+                yield from functions(node.body, prefix + node.name + ".")
+
+    old_funcs = dict(functions(old.body))
+    new_funcs = dict(functions(new.body))
     rules = []
     for name, fn in new_funcs.items():
         prior = old_funcs.get(name)
@@ -92,11 +100,15 @@ class PatchProof:
         self.files = {}
         self.classified = {}
         self.analyzer = analyzer
-        for path, new in changes(analyzer.base, patch).items():
+        edits = changes(analyzer.base, patch)
+        for path, new in edits.items():
             if path in isolated_tests:
                 continue
             base = analyzer.base / path
             if not (path.startswith("sqlglot/") and path.endswith(".py") and new and base.is_file()):
+                self.files.clear()
+                break
+            if path in edits.modes and edits.modes[path] != base.stat().st_mode & 0o777:
                 self.files.clear()
                 break
             self.files[path] = (base.read_bytes(), new)
@@ -124,6 +136,8 @@ class PatchProof:
                 continue
             rules = self.classify(path, entry_edits)
             if not rules:
+                return None
+            if any("." in row[0] for row in rules) and not _same_directives_text_only(*self.files[path]):
                 return None
             module = path[:-3].replace("/", ".").removesuffix(".__init__")
             for name, line, body_start, end, param, mask, mode in rules:

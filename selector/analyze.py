@@ -39,6 +39,7 @@ from .source_equivalence import (_same_directives_text_only, added_binding, comp
                                  text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
+from .tokenizer_tables import unchanged_limit_tokens
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -1062,7 +1063,8 @@ class Analyzer:
         number = self.num.get(MAX_NODES)
         if (not out.broken and not out.structural and number in self.queries.maps
                 and out.mask & ~out.query_blocked & (1 << number)
-                and unchanged_limit_assertions(self, edits, 1 << number)):
+                and (unchanged_limit_assertions(self, edits, 1 << number)
+                     or unchanged_limit_tokens(self, edits, 1 << number))):
             out.query_subsets[number] = []
         if (not out.broken and production_count and
                 edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}):
@@ -1622,7 +1624,7 @@ class Analyzer:
 
         safe_headers, query_defaults = {}, {}
         removed_keywords = {}
-        if shared_core(path) and not scope_edit:
+        if (dialect_code or shared_core(path)) and not scope_edit:
             changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
                                if old_funcs[q][1] != new_funcs[q][1]]
             if changed_headers:
@@ -1639,7 +1641,7 @@ class Analyzer:
                                 ast.Module(body=fn_new.body, type_ignores=[])
                             ):
                                 query_defaults[q] = (fn_old.body[0].lineno, fn_old.end_lineno)
-                        elif kind:
+                        elif kind and shared_core(path):
                             safe_headers[q] = kind
                             if kind == "remove" and "." not in q:
                                 omitted = {arg.arg for arg in fn_old.args.kwonlyargs}
@@ -1782,7 +1784,21 @@ class Analyzer:
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
         if out.query_spans.get(path) and not same_layout():
-            out.query_spans[path] = None
+            if (not diagnostics and (dialect_code or shared_core(path))
+                    and old_scopes == new_scopes and old_funcs.keys() == new_funcs.keys()
+                    and all(old[1] == new_funcs[q][1] for q, old in old_funcs.items())
+                    and frame_layout(self.old_compiled(path)[0], locals=False) == frame_layout(compiled, locals=False)
+                    and _same_directives_text_only((self.base / path).read_bytes(), new)):
+                # A local can change binding throughout a function. Attribute
+                # the entire body, with unchanged argument binding and closure
+                # shape, to every case that entered it.
+                out.query_spans[path] = [
+                    (_get_func_node(old_tree, q).body[0].lineno, old[4])
+                    for q, old in old_funcs.items() if old[2] != new_funcs[q][2]
+                ]
+                out.query_blocked |= self.signature_observers(path, args_changed=False) | self.state_refs.mask("co_varnames")
+            else:
+                out.query_spans[path] = None
         literal_default_only = (query_defaults and old_scopes == new_scopes
                                 and old_funcs.keys() == new_funcs.keys()
                                 and all(q in query_defaults or old[2] == new_funcs[q][2]

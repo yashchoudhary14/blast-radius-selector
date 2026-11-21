@@ -11,6 +11,7 @@ from types import CodeType
 from runner.parser_cases import MAX_NODES
 from runner.query_cases import EXECUTOR
 
+from .generator_modifiers import RENDER_MODIFIERS, render_modifier_edit, render_modifier_read_lines
 from .query_bindings import bindings, reference_lines
 
 
@@ -61,11 +62,11 @@ def dead_condition(analyzer, edits, files):
     return changed and ast.dump(old) == ast.dump(new)
 
 
-def frame_layout(code):
+def frame_layout(code, *, locals=True):
     # An edit in an untaken branch can still make a name local, create a
     # closure or turn the entire function into a generator.
-    return (code.co_name, code.co_flags, code.co_varnames, code.co_freevars, code.co_cellvars,
-            tuple(frame_layout(c) for c in code.co_consts if isinstance(c, CodeType)))
+    return (code.co_name, code.co_flags, code.co_varnames if locals else (), code.co_freevars, code.co_cellvars,
+            tuple(frame_layout(c, locals=locals) for c in code.co_consts if isinstance(c, CodeType)))
 
 
 @lru_cache(maxsize=32)
@@ -112,10 +113,12 @@ class QueryCases:
             return None
         if path in edits.modes and edits.modes[path] != original.stat().st_mode & 0o777:
             return None
-        result = bindings(original.read_bytes(), source, path)
-        if result is None:
+        before = original.read_bytes()
+        result = bindings(before, source, path)
+        render_modifiers = result is None and render_modifier_edit(before, source, path)
+        if result is None and not render_modifiers:
             return None
-        values, fresh = result
+        values, fresh = result if result is not None else ({RENDER_MODIFIERS}, set())
         if any(not name.startswith("_") for name in fresh):
             # A new name can also appear through a package's star re-export.
             mod = path[:-3].replace("/", ".").removesuffix(".__init__")
@@ -128,7 +131,8 @@ class QueryCases:
         readers = eligible & observers
         for name in values | fresh:
             for ref_path in analyzer.state_refs.refs.get(name, ()):
-                lines = reference_lines(analyzer, ref_path, name, name in values)
+                lines = (render_modifier_read_lines(analyzer, ref_path) if render_modifiers
+                         else reference_lines(analyzer, ref_path, name, name in values))
                 if not lines:
                     continue
                 for number in self.maps:
@@ -186,6 +190,8 @@ class QueryCases:
                 return {n: []}
             return {}
         for path, intervals in spans.items():
+            if path in edits.modes and edits.modes[path] != (analyzer.base / path).stat().st_mode & 0o777:
+                return {}
             imports = analyzer.indirect_hits.get(path, {})
             for start, end in intervals:
                 for line in range(start, end + 1):
