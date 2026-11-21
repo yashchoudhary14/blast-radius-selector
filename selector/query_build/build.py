@@ -12,10 +12,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from runner.parser_cases import GROUPS, MAX_NODES, filter_parser
 from runner.query_cases import QUERIES, filter_queries
 
 
-MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 CACHE = Path("/query-cache")
 
 
@@ -27,7 +27,10 @@ def run_case(node, index):
         from contexts import instrument
         instrument(case, module, node)
     elif index != "full":
-        filter_queries(case, module, node, [int(index)])
+        if node == MAX_NODES:
+            filter_parser(case, [int(index)])
+        else:
+            filter_queries(case, module, node, [int(index)])
     result = unittest.TestResult()
     unittest.TestSuite([case]).run(result)
     if not (result.wasSuccessful() and result.testsRun == 1 and not result.skipped):
@@ -64,10 +67,10 @@ def build():
 
     nodes = {n: len(list(load_sql_fixture_pairs("optimizer/tpc-" + family + "/tpc-" + family + ".sql")))
              for n, kind in QUERIES.items() for family in [kind.removeprefix("tpc")]}
-    nodes[MAX_NODES] = 1
+    nodes[MAX_NODES] = len(GROUPS)
     CACHE.mkdir(exist_ok=True)
-    jobs = [(n, i) for n, count in nodes.items() for i in range(count) if n != MAX_NODES]
-    jobs = [(n, "contexts") for n in QUERIES] + [(n, "full") for n in nodes] + jobs
+    jobs = [(n, i) for n, count in nodes.items() for i in range(count)]
+    jobs = [(n, "contexts") for n in nodes] + [(n, "full") for n in nodes] + jobs
     with ThreadPoolExecutor(max_workers=int(os.getenv("JOBS", 4))) as pool:
         for i, _ in enumerate(pool.map(capture, jobs), 1):
             if i % 20 == 0:
@@ -81,25 +84,23 @@ def build():
         full = read("full")
         mask = (1 << count) - 1
         rows = defaultdict(dict)
-        if node != MAX_NODES:
-            contexts = read("contexts")
-            if set(contexts) != {"-1", *map(str, range(count))}:
-                raise ValueError(f"incomplete full-loop contexts for {node}")
-            for i, paths in contexts.items():
-                bits = mask if i == "-1" else (1 << int(i))
-                for path, lines in paths.items():
-                    for line in lines:
-                        rows[path][line] = rows[path].get(line, 0) | bits
+        contexts = read("contexts")
+        if set(contexts) != {"-1", *map(str, range(count))}:
+            raise ValueError(f"incomplete full-loop contexts for {node}")
+        for i, paths in contexts.items():
+            bits = mask if i == "-1" else (1 << int(i))
+            for path, lines in paths.items():
+                for line in lines:
+                    rows[path][line] = rows[path].get(line, 0) | bits
         # A line unique to the uninstrumented loop has no known owner.
         # Isolated runs can add owners, never narrow this shared attribution.
         for path, lines in full.items():
             for line in lines:
                 rows[path].setdefault(line, mask)
-        if node != MAX_NODES:
-            for index in range(count):
-                for path, lines in read(index).items():
-                    for line in lines:
-                        rows[path][line] = rows[path].get(line, 0) | (1 << index)
+        for index in range(count):
+            for path, lines in read(index).items():
+                for line in lines:
+                    rows[path][line] = rows[path].get(line, 0) | (1 << index)
         # Intern masks, and group consecutive lines carrying the same mask.
         masks = sorted({v for m in rows.values() for v in m.values()})
         ids = {v: i for i, v in enumerate(masks)}
