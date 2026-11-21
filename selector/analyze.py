@@ -1022,7 +1022,7 @@ class Analyzer:
                 if single_edit and broken_included and self._is_full_schedule(out.mask | static_broad):
                     from .patch_proof import entry_edits
                     old_tree, _ = self.old_tree_and_lines(path)
-                    if not entry_edits(old_tree, new_tree_for_stmts):
+                    if not entry_edits(old_tree, ast.parse(new, path)):
                         return "changed_full", True
                 return None, False
 
