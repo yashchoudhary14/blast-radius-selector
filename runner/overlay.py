@@ -12,6 +12,7 @@ class PatchError(ValueError):
 
 HEADER = re.compile(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*|)$")
 NO_EOL = b"\\ No newline at end of file"
+MODE_HEADERS = (b"old mode", b"new mode", b"new file mode", b"deleted file mode")
 
 
 def _path(raw, *, prefix=True):
@@ -142,11 +143,15 @@ def changes(base, patch):
             i += 1
             while i < len(lines) and lines[i] and not lines[i].startswith((b"diff --git ", b"--- ")):
                 key, _, value = lines[i].rpartition(b" ")
+                if value == b"120000" and (key in MODE_HEADERS or lines[i].startswith(b"index ")):
+                    # Passing link target bytes to the regular-file overlay can
+                    # make a probe pass even when the actual link breaks a test.
+                    raise PatchError("symlink patches are unsupported")
                 if lines[i].startswith((b"rename ", b"copy ")):
                     operation, key, value = lines[i].split(b" ", 2)
                     meta[b"operation"] = operation
                     meta[key] = _path(value, prefix=False)
-                elif key in (b"old mode", b"new mode", b"new file mode", b"deleted file mode"):
+                elif key in MODE_HEADERS:
                     meta[key] = int(value, 8)
                 elif not lines[i].startswith((b"index ", b"similarity index ", b"dissimilarity index ")):
                     raise PatchError(f"unsupported patch header {lines[i][:120]!r}")
@@ -170,6 +175,8 @@ def changes(base, patch):
         if not (old or new):
             raise PatchError("missing file name")
         try:
+            if old and (base / old).is_symlink():
+                raise PatchError("symlink patches are unsupported")
             if any(not (base / p).resolve().is_relative_to(base) for p in (old, new) if p):
                 raise PatchError("path outside checkout")
             source = (base / old).read_bytes() if old else b""
