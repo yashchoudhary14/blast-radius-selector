@@ -1021,11 +1021,13 @@ class Analyzer:
                             operand_safe=production_count == 1)
                 if concrete_edits and not out.broken and new is not None:
                     unaffected = 0
+                    inert_for_memory = False
                     if concrete(path, "dialects"):
                         original = (self.base / path).read_bytes()
                         strict_changed = time_changes(path, original, new)
                         if strict_changed is not None:
                             unaffected = ~time_readers(self, strict_changed)
+                            inert_for_memory = True
                     elif self.dialect_reads.records and (concrete(path, "parsers") or concrete(path, "generators")):
                         original = (self.base / path).read_bytes()
                         tables = table_changes(path, original, new, self.dialect_reads.known_expression,
@@ -1034,11 +1036,18 @@ class Analyzer:
                         if not tables:
                             tables, keep = self.dialect_reads.generator_methods(path, original, new)
                         unaffected = self.dialect_reads.unrelated(tables) & ~keep
+                        inert_for_memory = bool(tables) and concrete(path, "parsers")
                     if subset_safe and unaffected & memory_bit:
                         out.dialect_subset_safe = True
                     # Attribute each proof to the edited module. Other paths
                     # can already require the test or add it later in this loop.
-                    omit = unaffected & ~(prior | self.index["heap_observers"])
+                    heap = self.index["heap_observers"]
+                    if inert_for_memory and subset_safe and not readers & memory_bit:
+                        # Time tries and parser dispatch tables are prepared
+                        # before the generator warmup and tracemalloc window.
+                        # The read proofs also cover any lookup during either.
+                        heap &= ~memory_bit
+                    omit = unaffected & ~(prior | heap)
                     out.direct &= ~omit
                     out.broad &= ~omit
                     out.priority &= ~omit

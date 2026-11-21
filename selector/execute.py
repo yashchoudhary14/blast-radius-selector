@@ -1,6 +1,7 @@
 """Compare measured runner CPU with the marginal cost of the emitted worker schedule."""
 
 import os
+import re
 import time
 from collections import defaultdict
 from functools import lru_cache
@@ -27,6 +28,7 @@ SINGLE = {
     1440: 8.075, 1490: 33.594, 1541: .459, 1560: 1.004, 1561: .600,
 }
 PROOF_CPU = {1082: .3, 1106: 4.5, 1107: .4, 1123: .5, 1361: 1.4}
+WITNESS_EDIT = re.compile(r"^\+(?!\+\+).*?(?:\bif\b|\bTrue\b|\bFalse\b|==|!=)", re.MULTILINE)
 
 
 class Execution:
@@ -60,6 +62,15 @@ class Execution:
 
     def cost(self, selected):
         return schedule(selected, self.millis)[1] / 1000
+
+    def apply_witnesses(self, proof, eligible, selected, commit, log):
+        for n in sorted(eligible, key=self.millis.get, reverse=True):
+            start = cpu_time()
+            reason = proof.witness(n)
+            if reason:
+                selected.remove(n)
+            log(f"proof {commit} n={n} passed={int(bool(reason))} reason={reason or 'no-witness'} "
+                f"cpu={cpu_time()-start:.6f}")
 
     def batches(self, pending, filtered):
         cheap = {n for n in pending if self.millis[n] < 500}
@@ -101,7 +112,12 @@ class Execution:
                 return remaining | potential_observers
             return remaining
 
+        # A witness that skips companion files also needs the whole-test guard.
+        eligible = {n for n in PROOF_CPU.keys() & selected if not candidates.query_blocked & (1 << n)}
         if get_session is None or time.monotonic() >= deadline:
+            if eligible and not candidates.structural and WITNESS_EDIT.search(patch):
+                proof = PatchProof(self.analyzer, patch, candidates.isolated_test_paths)
+                self.apply_witnesses(proof, eligible, selected, commit, log)
             return conservative(selected)
         if len(selected) == 1 and not candidates.python_paths:
             # A single direct data reader can save only its own worker on a pass.
@@ -214,17 +230,9 @@ class Execution:
                 f"modules={len({self.files[n] for n in ran})} complete={int(complete)}")
             return complete and not result.import_error and bool(ran)
 
-        # A witness that skips companion files also needs the whole-test guard.
-        eligible = {n for n in PROOF_CPU.keys() & selected if not candidates.query_blocked & (1 << n)}
         if eligible:
             proof = PatchProof(self.analyzer, patch, candidates.isolated_test_paths)
-            for n in sorted(eligible, key=self.millis.get, reverse=True):
-                start = cpu_time()
-                reason = proof.witness(n)
-                if reason:
-                    selected.remove(n)
-                log(f"proof {commit} n={n} passed={int(bool(reason))} reason={reason or 'no-witness'} "
-                    f"cpu={cpu_time()-start:.6f}")
+            self.apply_witnesses(proof, eligible, selected, commit, log)
 
         def roi_cost(s):
             c = emitted_cost(s)
