@@ -29,7 +29,7 @@ from .source_equivalence import (_same_directives_text_only, added_binding, comp
                                  dead_statement, docstring_edit, extracted_expression,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
                                  relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
-                                 text_message_only)
+                                 text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
 from .workers import schedule
@@ -737,6 +737,11 @@ class Analyzer:
         if scope_edits or headers:
             if same_code(before, compiled) and same_directives(old, new):
                 return 0  # Independent source readers were already selected.
+        if scope_edits and type_checking_imports(old_tree, new_tree) and _same_directives_text_only(old, new):
+            # The pinned runtime never sets typing.TYPE_CHECKING. Source and
+            # bytecode observers can still see the dormant imports or moved lines.
+            return (self.location_observers(all_dynamic=True) | self.state_refs.mask("co_consts")
+                    | self.doc_observers())
         if scope_edits and reordered_statements(old, new, old_tree, new_tree, path) and same_directives(old, new):
             return self.location_observers(all_dynamic=True)
         doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
@@ -1270,25 +1275,27 @@ class Analyzer:
 
     def _dict_key_candidates(self, path, new):
         """Use named lookup evidence for string keys and retain whole-table users."""
-        before = ast.parse((self.base / path).read_bytes())
+        old_source = (self.base / path).read_bytes()
+        before = ast.parse(old_source)
         after = ast.parse(new)
         left, left_ambiguous = _class_dict_nodes(before)
         right, right_ambiguous = _class_dict_nodes(after)
         if left_ambiguous or right_ambiguous or left.keys() != right.keys():
             return None
         changes = {}
+        reordered = set()
         for owner, attr in left:
             old, revised = left[owner, attr], right[owner, attr]
-            if len(old.keys) == len(revised.keys):
-                continue
-            if not attr.isupper() or attr.startswith("_"):
-                return None
             old_keys = _literal_string_keys(old)
             new_keys = _literal_string_keys(revised)
             if old_keys is None or new_keys is None:
-                return None
+                continue  # The full AST comparison rejects changes here.
             removed, added = old_keys - new_keys, new_keys - old_keys
             if not (removed or added):
+                if attr.isupper() and not attr.startswith("_") and _restore_dict_order(old, revised, old_keys):
+                    reordered.add(attr)
+                continue
+            if not attr.isupper() or attr.startswith("_"):
                 return None
             for mapping, keys in ((old, removed), (revised, added)):
                 entries = []
@@ -1300,9 +1307,14 @@ class Analyzer:
                 mapping.keys = [key for key, _ in entries]
                 mapping.values = [value for _, value in entries]
             changes.setdefault(attr, set()).update(removed | added)
-        if not changes or ast.dump(before) != ast.dump(after):
+        if (not (changes or reordered) or ast.dump(before) != ast.dump(after)
+                or not _same_directives_text_only(old_source, new)):
             return None
         mask = self.location_observers()
+        if reordered:
+            mask |= self.location_observers(all_dynamic=True) | (self.index["heap_observers"] & self.importers[path])
+            for attr in reordered:
+                mask |= self.state_refs.mask(attr)
         for attr, keys in changes.items():
             mask |= self.state_refs.mask(attr, tuple(sorted(keys)))
         return mask & self.binding_users(path)
@@ -1325,6 +1337,18 @@ class Analyzer:
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
             out.mark_broken("compile-warning", path)
             return
+        if single_edit and path == "tests/__init__.py" and len(tree.body) == 1:
+            doc = ast.get_docstring(tree, clean=False)
+            if (doc is not None and ">>>" not in doc and not (self.base / path).read_bytes()
+                    and _same_directives_text_only(b"", new)):
+                # The empty package now sets only __doc__. Keep readers of
+                # source, module attributes, docs and import-time allocations.
+                out.direct |= (self.doc_observers() | self.location_observers(all_dynamic=True)
+                               | self.state_refs.mask("*module")
+                               | (self.index["heap_observers"] & self.importers[path]))
+                out.dialect_subset_safe = False
+                out.query_spans = None
+                return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
@@ -1891,6 +1915,24 @@ def _literal_string_keys(mapping):
         return None
     keys = {key.value for key in explicit}
     return keys if len(keys) == len(explicit) else None
+
+
+def _restore_dict_order(old, revised, keys):
+    """Restore a permutation of inert entries before any unchanged unpacking."""
+    size = len(keys)
+    old_order = [node.value if node is not None else None for node in old.keys[:size]]
+    new_order = [node.value if node is not None else None for node in revised.keys[:size]]
+    if old_order == new_order or None in old_order or None in new_order:
+        return False
+    for i, (before, after) in enumerate(zip(old_order, new_order)):
+        if before != after and not (_inert_dict_value(old.values[i]) and _inert_dict_value(revised.values[i])):
+            return False
+    # Comparing the complete AST after restoration checks values, unpacking
+    # and every other statement. Consumers of iteration order remain selected.
+    by_key = {key: (revised.keys[i], revised.values[i]) for i, key in enumerate(new_order)}
+    revised.keys[:size] = [by_key[key][0] for key in old_order]
+    revised.values[:size] = [by_key[key][1] for key in old_order]
+    return True
 
 
 def _class_dict_nodes(tree):
