@@ -236,7 +236,9 @@ class Candidates:
     python_paths: list[str] = field(default_factory=list)
     dialect_subset_safe: bool = True
     isolated_test_paths: dict = field(default_factory=dict)
-    query_spans: dict | None = field(default_factory=dict)
+    query_spans: dict = field(default_factory=dict)
+    query_guarded: set[str] = field(default_factory=set)
+    query_heavy_only: bool = False
     query_blocked: int = 0
     query_subsets: dict = field(default_factory=dict)
     reasons: list[tuple[str, str]] = field(default_factory=list)
@@ -245,6 +247,11 @@ class Candidates:
     def mark_broken(self, reason, path):
         self.broken = True
         self.reasons.append((reason, path))
+
+    def guard_query_readers(self, path, mask):
+        self.query_spans[path] = None
+        self.query_guarded.add(path)
+        self.query_blocked |= mask
 
     @property
     def mask(self):
@@ -897,7 +904,7 @@ class Analyzer:
                 out.query_blocked |= readers
             if not ordinary_test_edit and not fixture_edit and (new is None or not (
                     path.startswith("sqlglot/") and p.suffix == ".py" and not created)):
-                out.query_spans = None
+                out.query_spans[path] = None
                 if p.suffix == ".py" or readers & self.index["heap_observers"]:
                     out.dialect_subset_safe = False
             if new is None or created:
@@ -957,7 +964,7 @@ class Analyzer:
                 if ordinary_test_edit or isolated_mask is not None:
                     # Attribute the test edit separately so its consumers cannot
                     # use partial probes, even if production already selected them.
-                    test = Candidates(query_spans=None)
+                    test = Candidates()
                     self.python(path, new, test, prioritize=prioritize)
                     out.direct |= test.direct
                     out.broad |= test.broad
@@ -972,7 +979,7 @@ class Analyzer:
                     continue
                 if path in registrations:
                     out.broad |= self.expression_readers(registrations[path])
-                    out.query_spans = None
+                    out.query_spans[path] = None
                     continue
                 if path.startswith("sqlglot/typing/") and new is not None:
                     mask = self.typing_readers(path, new, new_classes)
@@ -984,7 +991,7 @@ class Analyzer:
                                 omit = self.dialect_reads.unrelated({"EXPRESSION_METADATA": names})
                                 mask &= ~(omit & ~self.index["heap_observers"])
                         out.broad |= mask
-                        out.query_spans = None
+                        out.query_spans[path] = None
                         continue
                 prior, subset_safe = out.mask, out.dialect_subset_safe
                 self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
@@ -1390,7 +1397,7 @@ class Analyzer:
                                | self.state_refs.mask("*module")
                                | (self.index["heap_observers"] & self.importers[path]))
                 out.dialect_subset_safe = False
-                out.query_spans = None
+                out.query_spans[path] = None
                 return
         old_funcs, old_scopes = self.old(path)
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
@@ -1404,8 +1411,9 @@ class Analyzer:
             if dict_mask is None:
                 dict_mask = self._dict_key_candidates(path, new)
             if dict_mask is not None:
-                out.broad |= dict_mask | (self.location_observers() & self.importers[path])
-                out.query_spans = None
+                readers = dict_mask | (self.location_observers() & self.importers[path])
+                out.broad |= readers
+                out.guard_query_readers(path, readers)
                 return
         if dialect_code and not diagnostics and old_funcs.keys() < new_funcs.keys():
             old_tree, _ = self.old_tree_and_lines(path)
@@ -1419,7 +1427,7 @@ class Analyzer:
                         # by expression key even without a direct attribute read.
                         mask |= self.state_refs.mask("EXPR_CLASSES")
                 out.broad |= mask & self.binding_users(path)
-                out.query_spans = None
+                out.query_spans[path] = None
                 return
         if single_edit and not diagnostics and path.startswith("sqlglot/"):
             headers = [q for q, fn in new_funcs.items() if old_funcs.get(q, (None, None))[1] != fn[1]]
@@ -1433,7 +1441,7 @@ class Analyzer:
                 )
                 if refined is not None:
                     out.direct |= refined
-                    out.query_spans = None
+                    out.guard_query_readers(path, refined)
                     out.dialect_subset_safe = False
                     return
         # Module statements, top-level definition order, and class/function
@@ -1476,7 +1484,7 @@ class Analyzer:
                         observers |= self.expression_keys().get(name[:-4], 0)
                 out.broad |= observers
         if old_scopes != new_scopes or old_funcs.keys() != new_funcs.keys():
-            out.query_spans = None
+            out.query_spans[path] = None
         if dirty:
             # Class/module-level edits that sit entirely inside lambda bodies (e.g. entries of
             # Parser.FUNCTIONS / Generator.TRANSFORMS dicts) are code, not data: a lambda body runs
@@ -1522,7 +1530,7 @@ class Analyzer:
         def same_layout():
             return pinned_layout(self.base, path) == frame_layout(compiled)
 
-        safe_headers = {}
+        safe_headers, query_defaults = {}, {}
         if shared_core(path) and not scope_edit:
             changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
                                if old_funcs[q][1] != new_funcs[q][1]]
@@ -1535,7 +1543,12 @@ class Analyzer:
                         fn_old = _get_func_node(old_tree, q)
                         fn_new = _get_func_node(new_tree_for_stmts, q)
                         kind = inert_header(fn_old, fn_new, before.co_flags, compiled.co_flags)
-                        if kind:
+                        if kind == "default":
+                            if ast.dump(ast.Module(body=fn_old.body, type_ignores=[])) == ast.dump(
+                                ast.Module(body=fn_new.body, type_ignores=[])
+                            ):
+                                query_defaults[q] = (fn_old.body[0].lineno, fn_old.end_lineno)
+                        elif kind:
                             safe_headers[q] = kind
                             h0, h1 = _header_span(fn_old)
                             header_skip.update(range(h0, h1 + 1))
@@ -1613,12 +1626,12 @@ class Analyzer:
                 spans = None if frame_changed else _changed_stmt_spans(
                     fn_old, old_lines, new.splitlines(), fn_new, skip_header=kind == "annotation"
                 )
-                if out.query_spans is not None:
+                if out.query_spans.get(path, ()) is not None:
                     safe = body_spans(fn_old, fn_new, spans)
                     if safe:
                         out.query_spans.setdefault(path, []).extend(safe)
                     else:
-                        out.query_spans = None
+                        out.query_spans[path] = None
                 l_hits = self.line_hits(path)
                 if spans and l_hits:
                     stmt_mask = 0
@@ -1645,9 +1658,9 @@ class Analyzer:
                 out.broad |= (same & runtime) or same
             if old and revised and old[1] != revised[1]:
                 if not kind:
-                    out.query_spans = None
+                    out.query_spans[path] = None
                     dirty.add(owner)
-                elif out.query_spans is not None and kind != "annotation":
+                elif out.query_spans.get(path, ()) is not None and kind != "annotation":
                     before_node = _get_func_node(old_tree, q)
                     out.query_spans.setdefault(path, []).append((before_node.body[0].lineno, old[4]))
             if old and not revised and not owner:
@@ -1661,8 +1674,21 @@ class Analyzer:
                 if method in {"setUp", "tearDown", "setUpClass", "tearDownClass",
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
-        if out.query_spans and path in out.query_spans and not same_layout():
-            out.query_spans = None
+        if out.query_spans.get(path) and not same_layout():
+            out.query_spans[path] = None
+        literal_default_only = (query_defaults and old_scopes == new_scopes
+                                and old_funcs.keys() == new_funcs.keys()
+                                and all(q in query_defaults or old[2] == new_funcs[q][2]
+                                        for q, old in old_funcs.items())
+                                and same_layout())
+        if literal_default_only:
+            # Preserve the ordinary import candidates. Only tests with
+            # complete case coverage can separate a def from its callers.
+            out.query_spans[path] = list(query_defaults.values())
+            out.query_heavy_only = True
+            out.query_blocked |= self.annotation_observers()
+            for name in ("__defaults__", "__kwdefaults__", "gi_frame", "cr_frame", "ag_frame"):
+                out.query_blocked |= self.state_refs.mask(name)
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
         def compute_broad(limit_mask, *, include_probe=False):
@@ -1796,7 +1822,8 @@ class Analyzer:
             # the schedule is already at full-catalog price, and entry_edits cannot witness a top-level
             # None->bool default edit, setting broken=True matches "broken" with zero schedule penalty.
             if changed:
-                if single_edit and broken_included and self._is_full_schedule(out.mask | static_broad):
+                if (single_edit and not literal_default_only and broken_included
+                        and self._is_full_schedule(out.mask | static_broad)):
                     from .patch_proof import entry_edits
                     old_tree, _ = self.old_tree_and_lines(path)
                     if not entry_edits(old_tree, ast.parse(new, path)):

@@ -45,6 +45,22 @@ def inert_header(before, after, original_flags, updated_flags):
     if left[3:] != right[3:] or dump(left[0]) != dump(right[0]):
         return None
 
+    def literal_defaults(group, updated):
+        if tuple(name for name, _ in group) != tuple(name for name, _ in updated):
+            return False
+        for (_, a), (_, b) in zip(group, updated):
+            if a is b or (a is not None and b is not None and ast.dump(a) == ast.dump(b)):
+                continue
+            if not all(isinstance(value, ast.Constant) and type(value.value) in (type(None), bool)
+                       for value in (a, b)):
+                return False
+        return True
+
+    if any(dump(left[i]) != dump(right[i]) for i in (1, 2)) and all(
+        literal_defaults(left[i], right[i]) for i in (1, 2)
+    ):
+        return "default"
+
     def suffix(a, b):
         shorter, longer = sorted((a, b), key=len)
         if dump(shorter) != dump(longer[:len(shorter)]):

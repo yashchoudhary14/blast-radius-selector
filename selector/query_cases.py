@@ -11,6 +11,7 @@ from types import CodeType
 from runner.query_cases import EXECUTOR
 
 
+TPCDS = EXECUTOR + "test_execute_tpcds"
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 
 
@@ -105,9 +106,11 @@ class QueryCases:
 
     def subsets(self, candidates, edits):
         analyzer = self.analyzer
-        spans = candidates.query_spans
         if candidates.broken:
             return {}
+        spans = {path: rows for path, rows in candidates.query_spans.items() if rows}
+        opaque = {path for path, rows in candidates.query_spans.items() if rows is None}
+        unresolved = opaque - candidates.query_guarded
         if not spans:
             n = analyzer.num.get(MAX_NODES)
             if (n in self.maps and candidates.mask & (1 << n)
@@ -124,11 +127,20 @@ class QueryCases:
                     blocked |= imports.get(line, 0)
         subsets = {}
         for number in self.maps:
-            if not (candidates.mask & ~blocked) & (1 << number):
+            bit = 1 << number
+            if not (candidates.mask & ~blocked) & bit:
                 continue
-            if any(analyzer.index["reads"].get(path, 0) & (1 << number) for path in edits):
+            if any(analyzer.index["reads"].get(path, 0) & bit for path in edits):
                 continue
             count, masks, files = self.maps[number]
+            heavy = analyzer.ids[number] in (TPCDS, MAX_NODES)
+            if not heavy and (opaque or candidates.query_heavy_only):
+                continue
+            if opaque and (candidates.structural or any(
+                path in files or (analyzer.importers[path] | analyzer.index["all_hits"].get(path, 0)) & bit
+                for path in unresolved
+            )):
+                continue
             hit = 0
             for path, intervals in spans.items():
                 blocks = files.get(path, ())
@@ -145,7 +157,7 @@ class QueryCases:
         # Optimizer pool creation is already included in Execution.setup().
         node = execution.ids[n]
         pool = .65 if node.startswith(EXECUTOR + "test_execute_") else 0.
-        if node == EXECUTOR + "test_execute_tpcds":
+        if node == TPCDS:
             weights, total = self._get_tpcds_weights()
             if total > 0 and len(weights) == self.maps[n][0]:
                 fraction = sum(weights[i] for i in indices) / total
