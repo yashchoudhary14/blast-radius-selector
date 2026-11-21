@@ -82,7 +82,10 @@ class Execution:
         protected = set()
         potential_observers = set()
         for path in candidates.python_paths:
-            potential_observers.update(numbers(self.analyzer.index["heap_observers"] & self.analyzer.importers[path]))
+            heap = self.analyzer.index["heap_observers"] & self.analyzer.importers[path]
+            if not (path.startswith(("sqlglot/dialects/", "sqlglot/generators/")) or path == "sqlglot/generator.py"):
+                heap &= self.analyzer.index["all_hits"].get(path, 0)
+            potential_observers.update(numbers(heap))
         def conservative(remaining):
             # A pending failure can affect heap measurements in the full suite.
             # A passing probe only settles the methods it actually completed.

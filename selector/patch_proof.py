@@ -50,7 +50,7 @@ def entry_edits(old, new):
                 pos, param, mask = guard
                 if param in args or param in [a.arg for a in fn.args.kwonlyargs]:
                     fn.body.pop(pos)
-                    rules.append((name, prior.lineno, prior.body[-1].end_lineno, param, mask, "guard"))
+                    rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, param, mask, "guard"))
         defaults = fn.args.defaults
         if defaults and len(defaults) == len(prior.args.defaults):
             for i, before in enumerate(prior.args.defaults):
@@ -58,7 +58,7 @@ def entry_edits(old, new):
                 if (isinstance(before, ast.Constant) and before.value is None
                         and isinstance(after, ast.Constant) and type(after.value) is bool):
                     defaults[i] = before
-                    rules.append((name, prior.lineno, prior.body[-1].end_lineno, args[i-len(defaults)], 1, "default"))
+                    rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, args[i-len(defaults)], 1, "default"))
     return rules if rules and same(old, new) else None
 
 
@@ -122,12 +122,12 @@ class PatchProof:
             if not rules:
                 return None
             module = path[:-3].replace("/", ".").removesuffix(".__init__")
-            for name, line, end, param, mask, mode in rules:
+            for name, line, body_start, end, param, mask, mode in rules:
                 symbol = f"{module}.{name}"
                 if symbol + ".metadata" in meta or (mode == "default" and symbol + ".signature" in meta):
                     return None
                 entry = calls.get(f"{path}:{line}")
-                if entry is None and not any(line < loc <= end for loc in covered.get(path, ())):
+                if entry is None and not any(body_start <= loc <= end for loc in covered.get(path, ())):
                     reasons.add("uncalled")
                     continue
                 if not entry or not entry.get(param, 0) & mask:

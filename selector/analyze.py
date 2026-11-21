@@ -140,9 +140,15 @@ def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node):
             if best_block is None:
                 return None
             h_sp, _, _, body = best_block
-            spans.append(h_sp)
+            if h_sp != def_h:
+                spans.append(h_sp)
             before_stmt = after_stmt = None
+            first_doc = (body[0] if body and isinstance(body[0], ast.Expr)
+                         and isinstance(body[0].value, ast.Constant)
+                         and isinstance(body[0].value.value, str) else None)
             for s in body:
+                if s is first_doc:
+                    continue
                 s_end = s.end_lineno or s.lineno
                 if s_end < ins_ln:
                     before_stmt = s
@@ -212,8 +218,12 @@ class Analyzer:
             for module in modules:
                 mask |= self.importers[module]
             masks.append(mask)
-        self.indirect_hits = {path: {int(ln): masks[idx] for ln, idx in rows.items()}
-                              for path, rows in imports["files"].items()}
+        self.import_hits = {path: {int(ln): masks[idx] for ln, idx in rows.items()}
+                            for path, rows in imports["files"].items()}
+        self.import_modules = {path: {int(ln): imports["sets"][idx] for ln, idx in rows.items()}
+                               for path, rows in imports["files"].items()}
+        self.indirect_hits = {path: dict(rows) for path, rows in self.import_hits.items()}
+        self.cache_hits = {}
         # Lines executed only while their own module is imported (class/module bodies defining it).
         self.import_self_only = {path: {int(ln) for ln, idx in rows.items() if imports["sets"][idx] == [path]}
                                  for path, rows in imports["files"].items()}
@@ -223,8 +233,10 @@ class Analyzer:
                 users |= self.line_hits(path).get(ln, 0) | self.indirect_hits.get(path, {}).get(ln, 0)
             for path, lines in cache["files"].items():
                 rows = self.indirect_hits.setdefault(path, {})
+                c_rows = self.cache_hits.setdefault(path, {})
                 for ln in lines:
                     rows[ln] = rows.get(ln, 0) | users
+                    c_rows[ln] = c_rows.get(ln, 0) | users
         for file, (reads, directories) in self.index["collection_reads"].items():
             for key, paths in (("reads", reads), ("dirs", directories)):
                 masks = self.index[key]
@@ -393,11 +405,118 @@ class Analyzer:
                     # Packaging scripts and examples may be read or executed by path.
                     out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
                     continue
-                self.python(path, new, out, prioritize=prioritize, probe=probe)
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=(len(edits) == 1))
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 
-    def python(self, path, new, out, *, prioritize=False, probe=None):
+    @lru_cache(maxsize=1)
+    def _test_star_imports(self):
+        stars = set()
+        for file in sorted((self.base / "tests").rglob("*.py")):
+            rel = file.relative_to(self.base).as_posix()
+            tree, _ = self.old_tree_and_lines(rel)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                    stars.add(_resolve_import_from(rel, node))
+        return stars
+
+    def _unused_added_imports(self, path, old_tree, new_tree, rows):
+        old_dumps = [ast.dump(s) for s in old_tree.body]
+        new_dumps = [ast.dump(s) for s in new_tree.body]
+        sm = SequenceMatcher(None, old_dumps, new_dumps, autojunk=False)
+        added_aliases = []  # (mod_name, bound_name)
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                continue
+            if tag == "insert":
+                for stmt in new_tree.body[j1:j2]:
+                    if isinstance(stmt, ast.Import):
+                        for a in stmt.names:
+                            added_aliases.append((a.name, a.asname or a.name.partition(".")[0]))
+                    elif isinstance(stmt, ast.ImportFrom):
+                        if any(a.name == "*" for a in stmt.names) or stmt.module == "__future__":
+                            return False
+                        mod = _resolve_import_from(path, stmt)
+                        for a in stmt.names:
+                            added_aliases.append((mod, a.asname or a.name))
+                    else:
+                        return False
+            elif tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
+                o_stmt, n_stmt = old_tree.body[i1], new_tree.body[j1]
+                if type(o_stmt) is not type(n_stmt) or not isinstance(o_stmt, (ast.Import, ast.ImportFrom)):
+                    return False
+                if isinstance(o_stmt, ast.ImportFrom):
+                    if o_stmt.module != n_stmt.module or o_stmt.level != n_stmt.level or o_stmt.module == "__future__":
+                        return False
+                o_al = [ast.dump(a) for a in o_stmt.names]
+                n_al = [ast.dump(a) for a in n_stmt.names]
+                if any(a.name == "*" for a in n_stmt.names):
+                    return False
+                al_sm = SequenceMatcher(None, o_al, n_al, autojunk=False)
+                for a_tag, _, _, aj1, aj2 in al_sm.get_opcodes():
+                    if a_tag == "equal":
+                        continue
+                    if a_tag != "insert":
+                        return False
+                    mod = None if isinstance(n_stmt, ast.Import) else _resolve_import_from(path, n_stmt)
+                    for a in n_stmt.names[aj1:aj2]:
+                        added_aliases.append((a.name if mod is None else mod, a.asname or a.name.partition(".")[0] if mod is None else a.asname or a.name))
+            else:
+                return False
+        if not added_aliases:
+            return False
+        old_imported = set()
+        for stmt in old_tree.body:
+            if isinstance(stmt, ast.Import):
+                old_imported.update(a.name for a in stmt.names)
+            elif isinstance(stmt, ast.ImportFrom):
+                old_imported.add(_resolve_import_from(path, stmt))
+        for mod, _ in added_aliases:
+            if mod == "__future__" or not (mod.partition(".")[0] in sys.stdlib_module_names or mod in old_imported):
+                return False
+        added_names = {name for _, name in added_aliases}
+        for node in ast.walk(old_tree):
+            if isinstance(node, ast.Name):
+                if node.id in added_names or node.id == "__all__":
+                    return False
+            elif isinstance(node, ast.alias):
+                bound = node.asname or node.name.partition(".")[0]
+                if bound in added_names or node.name in added_names:
+                    return False
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in added_names or node.name == "__getattr__":
+                    return False
+            elif isinstance(node, ast.arg) and node.arg in added_names:
+                return False
+            elif isinstance(node, (ast.Global, ast.Nonlocal)) and added_names.intersection(node.names):
+                return False
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                callee = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+                if callee in ("globals", "locals", "vars", "dir"):
+                    return False
+        mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
+        if not all(r[0] == mod_name and r[1] in added_names for r in rows):
+            return False
+        if mod_name in self._test_star_imports():
+            return False
+        for attr in added_names:
+            if attr in self.state_refs.fields:
+                return False
+            for ref_path in self.state_refs.refs.get(attr, ()):
+                if ref_path == path:
+                    continue
+                ref_tree, _ = self.old_tree_and_lines(ref_path)
+                for node in ast.walk(ref_tree):
+                    if isinstance(node, ast.ImportFrom) and any(a.name == attr for a in node.names):
+                        target = _resolve_import_from(ref_path, node)
+                        if target == mod_name or f"{target}.{attr}" == mod_name:
+                            return False
+        if path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/")):
+            return False
+        return True
+
+    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
@@ -447,6 +566,10 @@ class Analyzer:
         changed = False
         code = None
         equivalent = set()
+        all_body_only = True
+        header_skip = set()
+        changed_symbols = set()
+        mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
         for q in old_funcs.keys() | new_funcs.keys():
             old, revised = old_funcs.get(q), new_funcs.get(q)
             if old and revised and old[2] == revised[2]:
@@ -471,6 +594,13 @@ class Analyzer:
                 old_tree, old_lines = self.old_tree_and_lines(path)
                 fn_old = _get_func_node(old_tree, q)
                 fn_new = _get_func_node(new_tree_for_stmts, q)
+                if fn_old is not None:
+                    h0, h1 = _header_span(fn_old)
+                    header_skip.update(range(h0, h1 + 1))
+                if owner == "":
+                    changed_symbols.add((mod_name, method.split("#")[0]))
+                elif owner in old_scopes:
+                    changed_symbols.add((f"{mod_name}.{owner}", method.split("#")[0]))
                 spans = _changed_stmt_spans(fn_old, old_lines, new.splitlines(), fn_new)
                 if out.query_spans is not None:
                     safe = body_spans(fn_old, fn_new, spans)
@@ -488,6 +618,7 @@ class Analyzer:
                 else:
                     out.direct |= hits.get(q, 0)
             elif old:
+                all_body_only = False
                 # Def header changed or function deleted: all tests executing any line of function body
                 out.direct |= hits.get(q, 0)
                 if not revised:
@@ -495,6 +626,7 @@ class Analyzer:
                     for ln in range(old[3], old[4] + 1):
                         out.direct |= l_hits.get(ln, 0)
             else:
+                all_body_only = False
                 same = self.index["by_name"].get(method.split("#")[0], 0)
                 out.broad |= (same & runtime) or same
             if old and revised and old[1] != revised[1]:
@@ -534,23 +666,43 @@ class Analyzer:
                                           for n in touched):
                     if data_only(old_tree, new_tree_for_stmts, base_src, new, touched, condition=True):
                         refined = 0
+                elif single_edit and self._unused_added_imports(path, old_tree, new_tree_for_stmts, rows):
+                    return
                 if refined == 0 and not rows:
                     return
         limit = -1 if refined is None else refined
         import_rows = self.indirect_hits.get(path)
         if import_rows and (scope_edit or changed):
             base_bytes = (self.base / path).read_bytes()
-            skip = set()
+            skip = set(header_skip) if (not scope_edit and changed and all_body_only) else set()
             usage = self.index.get("class_usage", {})
             if (dirty and "" not in dirty and usage and path.startswith("sqlglot/expressions/")
                     and all(f"{path}::{o}" in usage for o in dirty) and self.expr_owners(path, dirty)):
                 # Expression class-body data (arg_types, flags) executes only while its own module is
                 # imported; its effect reaches tests through the class, which the class-usage refinement
                 # below selects. Function bodies run at import time keep the importer attribution.
-                skip = self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
+                skip |= self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
+            import_clean = None
+            imp_mods = self.import_modules.get(path, {})
+            imp_hits = self.import_hits.get(path, {})
+            c_hits = self.cache_hits.get(path, {})
             for ln in _changed_old_lines(base_bytes, new):
-                if ln not in skip and ln not in equivalent:
-                    out.broad |= import_rows.get(ln, 0) & limit
+                if ln in skip or ln in equivalent:
+                    continue
+                if (not scope_edit and changed and all_body_only and single_edit and probe
+                        and (imp_hits.get(ln, 0) & limit) and ln in imp_mods
+                        and all(m.startswith("sqlglot/") for m in imp_mods[ln])):
+                    if import_clean is None:
+                        status, rows = probe()
+                        if status == "broken":
+                            out.broken = True
+                            out.broad |= coverage | self.importers[path]
+                            return
+                        import_clean = (status == "ok" and all((r[0], r[1]) in changed_symbols for r in rows))
+                    if import_clean:
+                        out.broad |= c_hits.get(ln, 0) & limit
+                        continue
+                out.broad |= import_rows.get(ln, 0) & limit
         if not dirty:
             return
         # A heap observer is a candidate if it executes the changed code (normal coverage rule),
@@ -685,6 +837,17 @@ def _changed_old_lines(old_bytes, new_bytes):
         else:
             lines.update(range(i1 + 1, i2 + 1))
     return lines
+
+
+def _resolve_import_from(path, node):
+    if node.level == 0:
+        return node.module or ""
+    parts = path[:-3].split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    up = node.level - 1
+    pkg = parts[:-up] if up else parts
+    return ".".join([*pkg, *([node.module] if node.module else [])])
 
 
 if __name__ == "__main__":
