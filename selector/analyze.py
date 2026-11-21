@@ -204,8 +204,12 @@ class Analyzer:
         for file, paths in self.index["collect_imports"].items():
             for path in paths:
                 self.importers[path] |= self.file_tests[file]
-        with gzip.open(maps / "import_lines.json.gz") as source:
-            imports = json.load(source)
+        imports_bin = maps / "import_lines.bin"
+        if imports_bin.is_file():
+            imports = marshal.loads(imports_bin.read_bytes())
+        else:
+            with gzip.open(maps / "import_lines.json.gz") as source:
+                imports = json.load(source)
         masks = []
         for modules in imports["sets"]:
             mask = 0

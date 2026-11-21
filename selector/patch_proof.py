@@ -98,11 +98,13 @@ class PatchProof:
 
     @functools.cached_property
     def rules(self):
-        return {p: entry_edits(ast.parse(old), ast.parse(new)) for p, (old, new) in self.files.items()}
+        return {p: entry_edits(self.analyzer.old_tree_and_lines(p)[0], ast.parse(new))
+                for p, (_, new) in self.files.items()}
 
     @functools.cached_property
     def identity(self):
-        return {p: identity_edits(ast.parse(old), ast.parse(new)) for p, (old, new) in self.files.items()}
+        return {p: identity_edits(self.analyzer.old_tree_and_lines(p)[0], ast.parse(new))
+                for p, (_, new) in self.files.items()}
 
     def witness(self, number):
         if not self.files:

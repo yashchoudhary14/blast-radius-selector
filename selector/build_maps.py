@@ -75,6 +75,9 @@ def build():
     for name in ("collect_imports", "collection_reads", "dialect_mentions", "durations"):
         index[name] = json.loads((MAPS / (name + ".json")).read_bytes())
     (MAPS / "index.bin").write_bytes(marshal.dumps(index))
+    (MAPS / "import_lines.bin").write_bytes(marshal.dumps(read_gz("import_lines.json.gz")))
+    if (MAPS / "query_cases.json.gz").is_file():
+        (MAPS / "query_cases.bin").write_bytes(marshal.dumps(read_gz("query_cases.json.gz")))
 
 
 if __name__ == "__main__":

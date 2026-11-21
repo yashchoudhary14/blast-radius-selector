@@ -3,6 +3,7 @@
 import ast
 import gzip
 import json
+import marshal
 from bisect import bisect_left
 from functools import lru_cache
 from types import CodeType
@@ -79,8 +80,12 @@ def body_spans(old, new, spans):
 class QueryCases:
     def __init__(self, analyzer):
         self.analyzer = analyzer
-        with gzip.open(analyzer.maps / "query_cases.json.gz") as source:
-            data = json.load(source)
+        bin_path = analyzer.maps / "query_cases.bin"
+        if bin_path.is_file():
+            data = marshal.loads(bin_path.read_bytes())
+        else:
+            with gzip.open(analyzer.maps / "query_cases.json.gz") as source:
+                data = json.load(source)
         self.maps = {analyzer.num[node]: row for node, row in data.items() if node in analyzer.num}
         self._tpcds_weights = None
 
