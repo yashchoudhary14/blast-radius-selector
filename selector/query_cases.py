@@ -123,6 +123,8 @@ class QueryCases:
         for number in self.maps:
             if not candidates.mask & (1 << number):
                 continue
+            if any(mask & (1 << number) for mask in candidates.isolated_test_paths.values()):
+                continue
             if any(analyzer.index["reads"].get(path, 0) & (1 << number) for path in edits):
                 continue
             count, masks, files = self.maps[number]
