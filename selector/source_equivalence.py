@@ -226,6 +226,40 @@ def line_insertion(before, after):
     return None
 
 
+def dead_statement(old, new, insertion):
+    """Prove a single inert statement was inserted into an existing suite."""
+    first, count = insertion
+    for owner in ast.walk(new):
+        for field, suite in ast.iter_fields(owner):
+            if not isinstance(suite, list):
+                continue
+            for index, stmt in enumerate(suite):
+                if not isinstance(stmt, ast.stmt) or not first <= stmt.lineno <= stmt.end_lineno < first + count:
+                    continue
+                # An assignment to a simple name in a literal-false branch
+                # introduces no class or module binding. Inside a function it
+                # could make a name local even though it is never assigned.
+                dead_branch = (isinstance(owner, (ast.Module, ast.ClassDef)) and field == "body"
+                               and index > 0 and isinstance(stmt, ast.If) and not stmt.orelse
+                               and isinstance(stmt.test, ast.Constant) and stmt.test.value is False
+                               and len(stmt.body) == 1 and isinstance(stmt.body[0], ast.Assign)
+                               and all(isinstance(t, ast.Name) for t in stmt.body[0].targets)
+                               and isinstance(stmt.body[0].value, ast.Constant))
+                # This raise cannot change local or closure bindings or mark
+                # an otherwise synchronous function as a generator.
+                dead_raise = (index > 0 and isinstance(suite[index - 1], ast.Return)
+                              and isinstance(stmt, ast.Raise) and stmt.cause is None
+                              and isinstance(stmt.exc, ast.Call) and isinstance(stmt.exc.func, ast.Name)
+                              and not stmt.exc.keywords and all(isinstance(a, ast.Constant) for a in stmt.exc.args))
+                if dead_branch or dead_raise:
+                    setattr(owner, field, suite[:index] + suite[index + 1:])
+                    try:
+                        return ast.dump(old) == ast.dump(new)
+                    finally:
+                        setattr(owner, field, suite)
+    return False
+
+
 def relocated_code(before, after, insertion):
     """Check live bytecode equality after moving source locations by one insertion."""
     first, count = insertion

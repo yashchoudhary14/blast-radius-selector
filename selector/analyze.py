@@ -19,7 +19,7 @@ from .collect import BASE, MAPS
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
-from .source_equivalence import (compile_source, docstring_only, line_insertion, relocated_code,
+from .source_equivalence import (compile_source, dead_statement, docstring_only, line_insertion, relocated_code,
                                  same_code, same_directives, signature_metadata)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 
@@ -475,8 +475,11 @@ class Analyzer:
         before, diagnostics = self.old_compiled(path)
         if diagnostics:
             return None
-        if insertion and relocated_code(before, compiled, insertion) and same_directives(old, new, insertion):
-            return self.location_observers()
+        if insertion:
+            old_tree, _ = self.old_tree_and_lines(path)
+            if (relocated_code(before, compiled, insertion) or dead_statement(old_tree, new_tree, insertion)):
+                if same_directives(old, new, insertion):
+                    return self.location_observers()
         if not (scope_edits or headers):
             return None
         if same_code(before, compiled) and same_directives(old, new):
