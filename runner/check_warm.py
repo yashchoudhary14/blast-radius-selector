@@ -12,20 +12,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="br-o")
     parser.add_argument("--jobs", type=int, default=6)
+    parser.add_argument("--cpusets", nargs="+", help="one disjoint Docker CPU list per shard")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--commit", action="append", default=[])
     args = parser.parse_args()
+    if args.cpusets and len(args.cpusets) != args.jobs:
+        parser.error("provide one CPU list per shard")
     out = args.out or TRACK / "scratch" / "o-warm" / ("retry" if args.commit else "gate")
     out.mkdir(parents=True, exist_ok=True)
     sets = [TRACK / "sample/sample", TRACK / "lab/corpus/c1", TRACK / "lab/corpus/c2"]
     mounts = [item for path in sets for item in ("-v", f"{path}:/sets/{path.name}:ro")]
-    base = ["docker", "run", "--rm", *LIMITS, *mounts,
+    base = [*mounts,
             args.image, "python", "-m", "runner.verify_warm", *[f"/sets/{d.name}" for d in sets]]
     extra = [item for name in args.commit for item in ("--commit", name)]
 
     def shard(i):
         with (out / f"{i}.jsonl").open("w") as sink:
-            return subprocess.run([*base, "--shard", f"{i}/{args.jobs}", *extra], stdout=sink).returncode
+            pin = ["--cpuset-cpus", args.cpusets[i]] if args.cpusets else []
+            cmd = ["docker", "run", "--rm", *LIMITS, *pin, *base, "--shard", f"{i}/{args.jobs}", *extra]
+            return subprocess.run(cmd, stdout=sink).returncode
 
     with ThreadPoolExecutor(args.jobs) as pool:
         status = list(pool.map(shard, range(args.jobs)))

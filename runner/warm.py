@@ -55,7 +55,9 @@ def stages(base, tests):
 
 
 def serve_stages(channels, root, base, tests, enter, run):
-    enter(root, base, False)
+    # Test children choose affinity at fork just like cold children. Pinning
+    # this long-lived ancestor would put every later probe on its startup CPUs.
+    enter(root, base, False, pin=False)
     started = time.process_time()
     child = None
     try:

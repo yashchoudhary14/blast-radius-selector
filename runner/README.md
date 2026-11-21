@@ -37,7 +37,7 @@ Core edits that intersect every snapshot, changed test code, and changes with un
 From the track directory, run the candidate-or-failing-plus-random-passing comparison with
 
 ```powershell
-& 'C:\dev\Buildathon\.venv\Scripts\python.exe' -B entry-wt-o/runner/check_warm.py --image br-o --jobs 6
+& 'C:\dev\Buildathon\.venv\Scripts\python.exe' -B entry-wt-o/runner/check_warm.py --image br-o --jobs 4 --cpusets 0,1 2,3 4,5 6,7
 ```
 
 It checks all labeled commits, reuses identical patch content across sets and writes per-commit outcomes and CPU to `scratch/o-warm/gate`. The benchmark accepts `--singles` in the selector image to measure the heavy catalog methods used by its cost model.
@@ -73,8 +73,8 @@ All 30 full failing sets matched the organizers' answers. The runner attempted a
 
 | Selection per commit | Mean child CPU | Median child CPU | Child CPU / recorded seconds | Mean parent CPU |
 | --- | ---: | ---: | ---: | ---: |
-| 1,620 tests | 143.493 s | 142.952 s | 1.393Ã— | 0.156 s |
-| 50 tests | 3.184 s | 3.034 s | 4.422Ã— | 0.024 s |
+| 1,620 tests | 143.493 s | 142.952 s | 1.393Ãƒâ€” | 0.156 s |
+| 50 tests | 3.184 s | 3.034 s | 4.422Ãƒâ€” | 0.024 s |
 
 The local Docker Desktop host also ran other lab jobs during the measurement. Each cell below is child CPU seconds for a single commit.
 

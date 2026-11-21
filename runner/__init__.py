@@ -37,7 +37,7 @@ def cpu_time():
     return time.process_time() + _usage() + sum(parent.cpu for parent in WarmParents.live)
 
 
-def _enter_tree(root, base, warmed):
+def _enter_tree(root, base, warmed, *, pin=True):
     os.chdir(root)
     sys.path[:] = [str(root)] + [
         p for p in sys.path if p and os.path.abspath(p) not in (str(root), str(base))
@@ -54,7 +54,7 @@ def _enter_tree(root, base, warmed):
     # Docker's CPU quota does not constrain sched_getaffinity(). Python
     # otherwise spawns one heavy pandas/duckdb process per host CPU.
     cpus = sorted(os.sched_getaffinity(0))
-    if len(cpus) > 2:
+    if pin and len(cpus) > 2:
         current = int(Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[36])
         start = cpus.index(current) if current in cpus else 0
         os.sched_setaffinity(0, [cpus[start], cpus[(start + 1) % len(cpus)]])
