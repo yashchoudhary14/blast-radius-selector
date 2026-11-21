@@ -41,7 +41,7 @@ def lane(execution, millis, patches, dst, start, deadline, static, fallback):
             now = time.monotonic()
             if now >= deadline:
                 log(f"fallback {path.stem} lane deadline")
-                print(record(path.stem, all_workers), file=dst)
+                print(record(path.stem, []), file=dst)  # DIAGNOSTIC: full price -> run nothing
                 continue
             # Reserve analysis time for every remaining patch. Allow unused
             # slots to accumulate after empty/cheap commits.
@@ -75,6 +75,11 @@ def lane(execution, millis, patches, dst, start, deadline, static, fallback):
             except Exception as exc:
                 log(f"fallback {path.stem} {exc!r}")
                 workers = all_workers
+                cost = all_cost
+            # DIAGNOSTIC VARIANT (not a contender): commits priced at the full catalog run nothing instead.
+            # Practice sim drop / full price = number of such commits; misses = how many of them break a test.
+            if cost >= all_cost:
+                workers = []
             print(record(path.stem, workers), file=dst)
 
 
