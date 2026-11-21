@@ -13,15 +13,18 @@ from label import read_report
 from unidiff import apply_patch
 
 
-def check(patch, tests):
+def check(patch, tests, workers):
     with TemporaryDirectory() as tmp:
         tree, report = Path(tmp, "sqlglot"), Path(tmp, "report.xml")
         shutil.copytree("/sqlglot", tree, ignore=shutil.ignore_patterns(".git", "__pycache__"))
         apply_patch(tree, patch.read_bytes())
-        command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--timeout=60",
+        command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--timeout=60", "-n", str(workers),
                    f"--junitxml={report}", "-q", *[test["id"] for test in tests]]
-        run = subprocess.run(command, cwd=tree, env=dict(os.environ, PYTHONPATH=str(tree)),
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        try:
+            run = subprocess.run(command, cwd=tree, env=dict(os.environ, PYTHONPATH=str(tree)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{patch.name}: dropped-test replay exceeded {exc.timeout}s") from None
         if run.returncode not in (0, 1, 5) or not report.exists():
             raise RuntimeError(f"{patch.name}: {run.stdout[-3000:].decode(errors='replace')}")
         failures = read_report(report, {"tests": tests})
@@ -35,13 +38,14 @@ def main():
     parser.add_argument("labels", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=0, help="pytest-xdist workers per mutant")
     args = parser.parse_args()
     catalog = {row["number"]: row for row in json.loads(args.manifest.read_bytes())["tests"]}
     drops = json.loads((args.labels / "drops.json").read_bytes())
     total = 0
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         pending = {pool.submit(check, args.labels / "commits" / f"{commit}.patch",
-                               [catalog[n] for n in numbers]): commit for commit, numbers in drops.items()}
+                               [catalog[n] for n in numbers], args.workers): commit for commit, numbers in drops.items()}
         for job in as_completed(pending):
             commit = pending[job]
             failures = job.result()
