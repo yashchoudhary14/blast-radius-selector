@@ -228,6 +228,8 @@ class Analyzer:
         self.base, self.maps = base, maps
         self.state_refs = StateRefs(self)
         self.index = marshal.loads((maps / "index.bin").read_bytes())
+        dict_reads_path = maps / "dict-reads.bin"
+        self.dict_reads = marshal.loads(dict_reads_path.read_bytes()) if dict_reads_path.is_file() else None
         self.tests = json.loads(manifest.read_bytes())["tests"]
         self.ids = {t["number"]: t["id"] for t in self.tests}
         self.num = {i: n for n, i in self.ids.items()}
@@ -569,6 +571,63 @@ class Analyzer:
             return False
         return True
 
+    def _dict_value_candidates(self, path, old_tree, new_bytes, rows):
+        if not self.dict_reads:
+            return None
+        old_dicts, old_amb = _class_dict_nodes(old_tree)
+        new_tree = ast.parse(new_bytes, path)
+        new_dicts, new_amb = _class_dict_nodes(new_tree)
+        if old_amb or new_amb or old_dicts.keys() != new_dicts.keys():
+            return None
+        tracked = self.dict_reads["dicts"]
+        changed_dicts = {}
+        for (cname, attr), od in old_dicts.items():
+            nd = new_dicts[(cname, attr)]
+            if len(od.keys) != len(nd.keys):
+                return None
+            did = (path, cname, attr)
+            changed_idxs = []
+            for idx, (ok, nk) in enumerate(zip(od.keys, nd.keys)):
+                if ok is None or nk is None:
+                    if ok is not None or nk is not None or ast.dump(od.values[idx]) != ast.dump(nd.values[idx]):
+                        return None
+                    continue
+                if ast.dump(ok) != ast.dump(nk):
+                    return None
+                if ast.dump(od.values[idx]) != ast.dump(nd.values[idx]):
+                    if did not in tracked:
+                        return None
+                    changed_idxs.append(idx)
+            if changed_idxs:
+                for idx in changed_idxs:
+                    nd.values[idx] = od.values[idx]
+                changed_dicts[did] = changed_idxs
+        if not changed_dicts or ast.dump(old_tree) != ast.dump(new_tree):
+            return None
+        mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
+        expected_owners = {(f"{mod_name}.{cname}", attr) for (_, cname, attr) in changed_dicts}
+        has_import_value_reads = any(
+            tracked[did]["import_whole"] or any(idx in tracked[did]["import_keys"] for idx in idxs)
+            for did, idxs in changed_dicts.items()
+        )
+        for row in rows:
+            if (row[0], row[1]) not in expected_owners and not has_import_value_reads:
+                return None
+        mask = self.dict_reads["incomplete"]
+        for did, idxs in changed_dicts.items():
+            entry = tracked[did]
+            mask |= entry["whole"]
+            kmap = entry["keys"]
+            imp_k = entry["import_keys"]
+            imp_mods = set(entry["import_whole"])
+            for idx in idxs:
+                mask |= kmap.get(idx, 0)
+                if idx in imp_k:
+                    imp_mods.update(imp_k[idx])
+            for mod in imp_mods:
+                mask |= self.importers.get(mod, 0) | self.file_tests.get(mod, 0)
+        return mask
+
     def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True):
         coverage = self.index["all_hits"].get(path, 0)
         try:
@@ -732,6 +791,16 @@ class Analyzer:
             if status == "ok" and not changed:
                 old_tree, _ = self.old_tree_and_lines(path)
                 touched = _changed_old_lines(base_src, new)
+                is_expr_cls = (
+                    path.startswith("sqlglot/expressions/")
+                    and self.expr_owners(path, dirty)
+                    and all(f"{path}::{o}" in self.index.get("class_usage", {}) for o in dirty)
+                )
+                if not is_expr_cls:
+                    dict_mask = self._dict_value_candidates(path, old_tree, new, rows)
+                    if dict_mask is not None:
+                        out.broad |= dict_mask
+                        return
                 if data_only(old_tree, new_tree_for_stmts, base_src, new, touched):
                     refined = self.state_refs.readers(rows)
                 elif not rows and same_runtime_declarations(base_src, new):
@@ -875,6 +944,33 @@ class _MaskLambdas(ast.NodeTransformer):
 
     def visit_Lambda(self, node):
         return ast.copy_location(ast.Constant(value="<lambda>"), node)
+
+
+def _class_dict_nodes(tree):
+    """Return ({(cls_qname, attr): ast.Dict}, ambiguous_keys) for direct class-body dict literals."""
+    nodes = {}
+    ambiguous = set()
+
+    def walk(node, prefix=()):
+        for stmt in node.body:
+            if isinstance(stmt, ast.ClassDef):
+                cname = ".".join((*prefix, stmt.name))
+                for item in stmt.body:
+                    if isinstance(item, (ast.Assign, ast.AnnAssign)) and item.value is not None:
+                        targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                        if (
+                            isinstance(item.value, ast.Dict)
+                            and len(targets) == 1
+                            and isinstance(targets[0], ast.Name)
+                        ):
+                            key = (cname, targets[0].id)
+                            if key in nodes:
+                                ambiguous.add(key)
+                            nodes[key] = item.value
+                walk(stmt, (*prefix, stmt.name))
+
+    walk(tree)
+    return nodes, ambiguous
 
 
 def _function_lines(src_bytes, name):
