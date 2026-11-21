@@ -196,15 +196,24 @@ class Execution:
                 log(f"proof {commit} n={n} passed={int(bool(reason))} reason={reason or 'no-witness'} "
                     f"cpu={cpu_time()-start:.6f}")
 
+        def roi_cost(s):
+            c = self.cost(s)
+            if (subset is not None and self.memory in s and self.memory not in selected
+                    and self.memory not in observed and self.memory not in failed):
+                c_no_mem = self.cost(s - {self.memory})
+                if .5 * (c - c_no_mem) > subset_cost:
+                    return c_no_mem + subset_cost + 0.1 * (c - c_no_mem)
+            return c
+
         while time.monotonic() < deadline:
             pending = selected - observed - protected
             if not pending:
                 break
-            static = self.cost(conservative(selected))
+            static = roi_cost(conservative(selected))
             budget = deadline - time.monotonic()
             best, margin = None, 0
-            # A completed passing probe gives evidence for the clean path.
-            pass_chance = 0.75 if observed else 0.5
+            # A completed passing probe gives evidence for the clean path unless a failure was seen.
+            pass_chance = 0.75 if (observed and not failed) else 0.5
             seen = set()
             for batch in self.batches(pending):
                 key = frozenset(batch)
@@ -214,9 +223,9 @@ class Execution:
                 estimate = run_cost(batch)
                 if estimate > budget:
                     continue
-                gain = static - self.cost(conservative(selected - batch))
-                if failed or (len(batch) == 1 and batch & discounts.keys()):
-                    net = gain - estimate
+                gain = static - roi_cost(conservative(selected - batch))
+                if failed:
+                    net = pass_chance * gain - estimate
                 else:
                     first = min(batch, key=rank)
                     net = pass_chance * (gain - estimate) - (1 - pass_chance) * run_cost([first])
@@ -225,8 +234,8 @@ class Execution:
 
             replay = None
             for n in sorted((eligible & pending) - tried_replay, key=self.millis.get, reverse=True):
-                gain = static - self.cost(conservative(selected - {n}))
-                if PROOF_CPU[n] < budget and gain - PROOF_CPU[n] > margin:
+                gain = static - roi_cost(conservative(selected - {n}))
+                if PROOF_CPU[n] < budget and 0.2 * gain - PROOF_CPU[n] > margin:
                     replay = n
                     break
             if replay is not None:

@@ -82,6 +82,21 @@ class QueryCases:
         with gzip.open(analyzer.maps / "query_cases.json.gz") as source:
             data = json.load(source)
         self.maps = {analyzer.num[node]: row for node, row in data.items() if node in analyzer.num}
+        self._tpcds_weights = None
+
+    def _get_tpcds_weights(self):
+        if self._tpcds_weights is None:
+            fixture = self.analyzer.base / "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+            if fixture.is_file():
+                lines = [ln for ln in fixture.read_text(encoding="utf-8").splitlines()
+                         if ln and not ln.startswith("--")]
+                stmts = "\n".join(lines).split(";")
+                weights = [1.0 if "# execute: true" in stmts[i] else 0.04
+                           for i in range(0, len(stmts) - 1, 2)]
+                self._tpcds_weights = (weights, sum(weights))
+            else:
+                self._tpcds_weights = ([], 0.0)
+        return self._tpcds_weights
 
     def subsets(self, candidates, edits):
         analyzer = self.analyzer
@@ -120,6 +135,12 @@ class QueryCases:
 
     def body_cost(self, n, indices, execution):
         # Optimizer pool creation is already included in Execution.setup().
-        pool = .65 if execution.ids[n].startswith(EXECUTOR + "test_execute_") else 0.
+        node = execution.ids[n]
+        pool = .65 if node.startswith(EXECUTOR + "test_execute_") else 0.
+        if node == EXECUTOR + "test_execute_tpcds":
+            weights, total = self._get_tpcds_weights()
+            if total > 0 and len(weights) == self.maps[n][0]:
+                fraction = sum(weights[i] for i in indices) / total
+                return pool + max(0., execution.body[n] - pool) * fraction
         fraction = len(indices) / self.maps[n][0]
         return pool + max(0., execution.body[n] - pool) * fraction
