@@ -2,7 +2,6 @@
 
 import __future__
 import ast
-import dis
 import marshal
 import re
 import tokenize
@@ -78,79 +77,97 @@ def _outside(source, node):
             lines[node.end_lineno - 1][node.end_col_offset:] + b"".join(lines[node.end_lineno:]))
 
 
-def _docs(tree):
-    yield "", _doc(tree)
-    for node in tree.body:
-        if _plain_class(node):
-            # An inherited __init_subclass__ or metaclass may consume the
-            # new value while constructing a class, before it is exported.
-            yield node.name, _doc(node)
+def _undecorated_class(node):
+    return (isinstance(node, ast.ClassDef) and not (
+        node.keywords or node.decorator_list or getattr(node, "type_params", ())))
 
 
 def _plain_class(node):
-    return (isinstance(node, ast.ClassDef)
-            and not (node.bases or node.keywords or node.decorator_list or getattr(node, "type_params", ())))
+    return _undecorated_class(node) and not node.bases
 
 
-def _doc_assignment(code, value):
-    instructions = list(dis.get_instructions(code))
-    for index, (load, store) in enumerate(zip(instructions, instructions[1:])):
-        if (load.opname != "LOAD_CONST" or load.argval != value
-                or store.opname != "STORE_NAME" or store.argval != "__doc__"):
-            continue
-        # A constant could also be used by a live instruction outside the
-        # doc assignment, in which case clearing the slot would hide changes.
-        if sum(i.opcode in dis.hasconst and i.arg == load.arg for i in instructions) == 1:
-            positions = {load.offset // 2, store.offset // 2}
-            # A module's annotation setup can inherit the first statement's
-            # columns, including the closing quote of its docstring.
-            if index and instructions[index - 1].opname == "SETUP_ANNOTATIONS":
-                positions.add(instructions[index - 1].offset // 2)
-            return load.arg, positions
+def docstring_only(old_source, source, old_tree, tree):
+    """Locate an isolated doc value change with stable source line numbers."""
+    scopes = [(old_tree, tree)]
+    scopes.extend((a, b) for a, b in zip(old_tree.body, tree.body)
+                  if _undecorated_class(a) and _undecorated_class(b) and a.name == b.name)
+    for before, after in scopes:
+        if _isolated_change(old_source, source, _doc(before), _doc(after)):
+            return before
     return None
 
 
-def _without_doc_value(before, after, original, updated):
-    old = _doc_assignment(before, original)
-    new = _doc_assignment(after, updated)
-    if old is None or old != new:
-        return None
-    slot, instructions = old
-    for index, (left, right) in enumerate(zip(before.co_positions(), after.co_positions())):
-        if left != right and (index not in instructions or left[:2] != right[:2]):
-            return None
-    constants = (*after.co_consts[:slot], original, *after.co_consts[slot + 1:])
-    return after.replace(co_consts=constants, co_linetable=before.co_linetable)
+def doc_class_safe(node, tree, path, load_tree):
+    """Admit ordinary classes and audited base classes with doc-independent construction."""
+    def bindings(name, preceding):
+        result = []
+        for index, top in enumerate(preceding):
+            for stmt in ast.walk(top):
+                if isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == name:
+                    result.append((index, stmt))
+                elif isinstance(stmt, (ast.Import, ast.ImportFrom)) and any(
+                    (a.asname or a.name.partition(".")[0]) in (name, "*") for a in stmt.names
+                ):
+                    result.append((index, stmt))
+                elif isinstance(stmt, ast.Name) and stmt.id == name and not isinstance(stmt.ctx, ast.Load):
+                    result.append((index, stmt))
+        return result
 
+    active = set()
 
-def _class_body(code, name):
-    matches = [(i, c) for i, c in enumerate(code.co_consts)
-               if isinstance(c, CodeType) and c.co_qualname == name]
-    return matches[0] if len(matches) == 1 else (None, None)
-
-
-def docstring_only(old_source, source, old_tree, tree, before, after):
-    """Accept one existing, doctest-free docstring with all live code intact."""
-    old_docs = dict(_docs(old_tree))
-    for name, revised in _docs(tree):
-        original = old_docs.get(name)
-        if original is None or revised is None or original.value == revised.value:
-            continue
-        if _outside(old_source, original) != _outside(source, revised):
-            continue
-        if not name:
-            normalized = _without_doc_value(before, after, original.value, revised.value)
-        else:
-            old_index, old_body = _class_body(before, name)
-            index, body = _class_body(after, name)
-            if index is None or old_index != index:
+    def safe(cls, body, source):
+        if cls in active:
+            return False
+        if source == "sqlglot/expressions/core.py" and cls.name == "Expr" and cls is not node:
+            # The pinned trait is an identity decorator. Expr's only doc use
+            # at subclass creation copies the received str back to __doc__.
+            return True
+        if not _undecorated_class(cls) or (cls is not node and any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "__init_subclass__"
+            for n in cls.body
+        )):
+            return False
+        preceding = body[:body.index(cls)]
+        active.add(cls)
+        for base in cls.bases:
+            if not safe_base(base, preceding, source):
                 return False
-            body = _without_doc_value(old_body, body, original.value, revised.value)
-            if body is None:
-                return False
-            normalized = after.replace(co_consts=(*after.co_consts[:index], body, *after.co_consts[index + 1:]))
-        return normalized is not None and same_code(before, normalized)
-    return False
+        active.remove(cls)
+        return True
+
+    def safe_base(base, preceding, source):
+        name = base.value if isinstance(base, ast.Attribute) and base.attr == "ABC" else base
+        if not isinstance(name, ast.Name):
+            return False
+        matches = bindings(name.id, preceding)
+        if len(matches) != 1:
+            return False
+        index, statement = matches[0]
+        if statement is not preceding[index]:
+            return False
+        if name is not base:
+            return isinstance(statement, ast.Import) and any(
+                a.name == "abc" and (a.asname or a.name) == name.id for a in statement.names)
+        if isinstance(statement, ast.ClassDef):
+            return safe(statement, preceding, source)
+        if not isinstance(statement, ast.ImportFrom) or statement.level or not statement.module:
+            return False
+        imported = [a.name for a in statement.names if (a.asname or a.name) == name.id]
+        if len(imported) != 1:
+            return False
+        # EnumType treats __doc__ as a special attribute. ABCMeta only
+        # checks member values for __isabstractmethod__, which str lacks.
+        if (statement.module, imported[0]) in {("enum", "Enum"), ("abc", "ABC")}:
+            return True
+        if not statement.module.startswith("sqlglot.expressions."):
+            return False
+        target = statement.module.replace(".", "/") + ".py"
+        other = load_tree(target)
+        classes = bindings(imported[0], other.body)
+        return (len(classes) == 1 and isinstance(classes[0][1], ast.ClassDef)
+                and other.body[classes[0][0]] is classes[0][1] and safe(classes[0][1], other.body, target))
+
+    return safe(node, tree.body, path)
 
 
 def _plain_function(tree, name):
