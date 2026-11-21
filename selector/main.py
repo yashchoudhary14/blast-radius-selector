@@ -38,6 +38,10 @@ def lane(execution, millis, patches, output, start, deadline, static, fallback):
         slot = (deadline - start) / len(patches)
         for position, path in enumerate(patches):
             now = time.monotonic()
+            if now >= deadline:
+                log(f"fallback {path.stem} lane deadline")
+                print(record(path.stem, all_workers), file=dst)
+                continue
             # Reserve analysis time for every remaining patch. Allow unused
             # slots to accumulate after empty/cheap commits.
             remaining = len(patches) - position
@@ -88,20 +92,33 @@ def main():
     start = time.monotonic()
     paths = sorted((args.data / "commits").glob("*.patch"))
     manifest = args.data / "tests.json"
-    tests = json.loads(manifest.read_bytes())["tests"]
-    millis = {row["number"]: math.floor(row["seconds"] * 1000 + 0.5) for row in tests}
-    fallback = schedule(millis, millis)
     static = args.static or os.getenv("SELECTOR_STATIC") == "1"
-    deadline = start + min(165, 5 * len(paths))
+    # Practice: ~30 commits in 180 s. Final: ~1.5x commits in 270 s. Infer the limit from the batch
+    # size and keep a safety margin; never plan past it.
+    limit = 180 if len(paths) <= 36 else 270
+    deadline = start + min(5.2 * len(paths), limit - 18)
     try:
         mark = time.process_time()
         analyzer = Analyzer(manifest)
-        execution = Execution(analyzer, tests, millis)
-        log(f"map_load_cpu={time.process_time()-mark:.6f}")
-        if paths and not static:
-            warm()
     except Exception as exc:
-        log(f"fallback startup {exc!r}")
+        log(f"fallback analyzer {exc!r}")
+        analyzer = None
+    tests = getattr(analyzer, "tests", None)
+    if tests is None:
+        tests = json.loads(manifest.read_bytes())["tests"]
+    millis = {row["number"]: math.floor(row["seconds"] * 1000 + 0.5) for row in tests}
+    fallback = schedule(millis, millis)
+    execution = None
+    if analyzer is not None:
+        try:
+            execution = Execution(analyzer, tests, millis)
+            log(f"map_load_cpu={time.process_time()-mark:.6f}")
+            if paths and not static:
+                warm()
+        except Exception as exc:
+            log(f"fallback startup {exc!r}")
+            execution = None
+    if execution is None:
         for path in paths:
             print(record(path.stem, fallback[0]))
         paths = []

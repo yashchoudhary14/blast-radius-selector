@@ -3,8 +3,6 @@
 import ast
 from collections import Counter
 from hashlib import blake2b
-from io import BytesIO
-from tokenize import detect_encoding
 
 FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 
@@ -18,14 +16,27 @@ def structural(node):
 
 
 def snapshot(tree, source, cached=None):
-    """Only structurally hash function bodies whose exact source changed."""
-    cached = cached or {}
-    # An encoding declaration can change string literals anywhere in the
-    # module while leaving the function's own bytes exactly the same.
-    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    encoding, _ = detect_encoding(BytesIO(normalized).readline)
-    lines = normalized.split(b"\n")
+    """Structurally hash function headers and bodies using AST comparison."""
     functions, scopes = {}, {}
+
+    def visit_nested_funcs(func_node, prefix):
+        counts = Counter()
+        saved = []
+        for child in ast.walk(func_node):
+            if child is not func_node and isinstance(child, FUNCTION):
+                name = prefix + child.name
+                counts[name] += 1
+                if counts[name] > 1:
+                    name += "#" + str(counts[name])
+                start = min([child.lineno, *(d.lineno for d in child.decorator_list)])
+                body = structural(child)
+                saved_body = child.body
+                child.body = []
+                header = structural(child)
+                child.body = [ast.Pass()]
+                saved.append((child, saved_body))
+                functions[name] = body, header, body, start, child.end_lineno
+        return saved
 
     def visit(node, prefix):
         counts = Counter()
@@ -43,16 +54,12 @@ def snapshot(tree, source, cached=None):
             if isinstance(stmt, ast.ClassDef):
                 visit(stmt, name + ".")
                 continue
+            visit_nested_funcs(stmt, name + ".")
             start = min([stmt.lineno, *(d.lineno for d in stmt.decorator_list)])
-            raw = digest(encoding.encode() + b"\0" + b"\n".join(lines[start - 1:stmt.end_lineno]))
-            old = cached.get(name)
-            if old and raw == old[0]:
-                header, body = old[1:3]
-            else:
-                body = structural(stmt)
-                stmt.body = []
-                header = structural(stmt)
-            functions[name] = raw, header, body, start, stmt.end_lineno
+            body = structural(stmt)
+            stmt.body = []
+            header = structural(stmt)
+            functions[name] = body, header, body, start, stmt.end_lineno
         node.body = []
         scopes[prefix.rstrip(".")] = structural(node), tuple(data), tuple(order)
 

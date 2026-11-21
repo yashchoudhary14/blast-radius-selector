@@ -119,6 +119,7 @@ class Execution:
         if not selected or get_session is None or candidates.broken:
             return selected
         failed = set()
+        suite_observers = set()
 
         def run(order, early):
             budget = deadline - time.monotonic()
@@ -130,14 +131,22 @@ class Execution:
             used = cpu_time() - start
             bad = {self.num[node] for node in result.failing}
             failed.update(bad)
+            if bad:
+                # A fresh subset cannot reproduce allocations retained by an
+                # earlier failure in the full suite. Keep process-wide heap
+                # assertions when they import a changed module in that suite.
+                for path in candidates.python_paths:
+                    suite_observers.update(numbers(self.analyzer.index["heap_observers"] &
+                                                   self.analyzer.importers[path]))
             if result.import_error:
                 for path in candidates.python_paths:
                     selected.update(numbers(self.analyzer.importers[path] |
                                             self.analyzer.index["all_hits"].get(path, 0)))
             complete = "incomplete child run" not in result.notes
             # A killed process may still owe module/class teardown.
-            if complete:
+            if complete and not result.import_error:
                 selected.difference_update(self.num[node] for node in result.ran if node not in result.failing)
+            selected.update(suite_observers)
             log(f"run {commit} attempted={len(result.ran)}/{len(order)} failures={len(bad)} "
                 f"cpu={used:.6f} child={result.cpu_s:.6f} complete={int(complete)}")
             return complete and not result.import_error
@@ -190,7 +199,7 @@ class Execution:
         # Once failure is known, compare both the whole remainder and its
         # class-sized batches. Reprice after each batch using actual passes.
         if failed:
-            pending = (cheap & selected) - failed
+            pending = (cheap & selected) - failed - suite_observers
             while pending and time.monotonic() < deadline:
                 groups = defaultdict(list)
                 for n in sorted(pending, key=rank):
@@ -208,7 +217,7 @@ class Execution:
                     return selected
                 pending.difference_update(best)
 
-        possible = (selected - failed) & heavy
+        possible = (selected - failed - suite_observers) & heavy
         info = root = None
         checked = False
         for n in sorted(possible, key=lambda i: (-self.millis[i], i)):

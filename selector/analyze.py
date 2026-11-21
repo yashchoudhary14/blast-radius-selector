@@ -13,14 +13,143 @@ from functools import lru_cache
 from pathlib import Path
 
 from runner.overlay import changes
+
+from .collect import BASE, MAPS
 from .scopes import scope_changed, snapshot
 
+COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
+try:
+    COMPOUND = (*COMPOUND, ast.TryStar)
+except AttributeError:
+    pass
 
-def numbers(mask):
-    while mask:
-        bit = mask & -mask
-        yield bit.bit_length() - 1
-        mask ^= bit
+
+def _get_func_node(tree, qname):
+    curr = tree
+    for part in qname.split("."):
+        base_name, _, idx_str = part.partition("#")
+        target_idx = int(idx_str) if idx_str else 1
+        count = 0
+        found = None
+        if isinstance(curr, (ast.Module, ast.ClassDef)):
+            children = curr.body
+        else:
+            children = (c for c in ast.walk(curr) if c is not curr)
+        for stmt in children:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and stmt.name == base_name:
+                count += 1
+                if count == target_idx:
+                    found = stmt
+                    break
+        if found is None:
+            return None
+        curr = found
+    return curr
+
+
+def _header_span(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+        end = node.body[0].lineno - 1 if node.body else (node.end_lineno or node.lineno)
+        return start, max(start, end)
+    if isinstance(node, COMPOUND):
+        end = node.body[0].lineno - 1 if node.body else (node.end_lineno or node.lineno)
+        return node.lineno, max(node.lineno, end)
+    return node.lineno, node.end_lineno or node.lineno
+
+
+def _collect_blocks_and_stmts(func_node):
+    blocks, stmts = [], []
+
+    def walk_block(header_sp, body):
+        blocks.append((header_sp, body))
+        for s in body:
+            stmts.append(s)
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            h_sp = _header_span(s)
+            if hasattr(s, "body") and s.body:
+                walk_block(h_sp, s.body)
+            if hasattr(s, "orelse") and s.orelse:
+                walk_block(h_sp, s.orelse)
+            if hasattr(s, "handlers") and s.handlers:
+                for h in s.handlers:
+                    stmts.append(h)
+                    hh_end = h.body[0].lineno - 1 if h.body else (h.end_lineno or h.lineno)
+                    walk_block((h.lineno, max(h.lineno, hh_end)), h.body)
+            if hasattr(s, "finalbody") and s.finalbody:
+                walk_block(h_sp, s.finalbody)
+            if hasattr(s, "cases") and s.cases:
+                for c in s.cases:
+                    if c.body:
+                        p_start = c.pattern.lineno
+                        p_end = c.body[0].lineno - 1
+                        walk_block((p_start, max(p_start, p_end)), c.body)
+
+    walk_block(_header_span(func_node), func_node.body)
+    return blocks, stmts
+
+
+def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node):
+    if func_node is None or new_func_node is None:
+        return None
+    f_start = min([func_node.lineno, *(d.lineno for d in func_node.decorator_list)])
+    f_end = func_node.end_lineno or func_node.lineno
+    nf_start = min([new_func_node.lineno, *(d.lineno for d in new_func_node.decorator_list)])
+    nf_end = new_func_node.end_lineno or new_func_node.lineno
+
+    old_slice = old_lines[f_start - 1 : f_end]
+    new_slice = new_lines[nf_start - 1 : nf_end]
+
+    blocks, stmts = _collect_blocks_and_stmts(func_node)
+    def_h = _header_span(func_node)
+    spans = []
+
+    sm = SequenceMatcher(None, old_slice, new_slice)
+    for tag, i1, i2, _, _ in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if i1 < i2:
+            for ln in range(f_start + i1, f_start + i2):
+                if def_h[0] <= ln <= def_h[1]:
+                    return [(f_start, f_end)]
+                enclosing = [s for s in stmts if s.lineno <= ln <= (s.end_lineno or s.lineno)]
+                if not enclosing:
+                    return None
+                smallest = min(enclosing, key=lambda s: (s.end_lineno or s.lineno) - s.lineno)
+                if isinstance(smallest, (*COMPOUND, ast.ExceptHandler)):
+                    if isinstance(smallest, ast.ExceptHandler):
+                        h_end = smallest.body[0].lineno - 1 if smallest.body else (smallest.end_lineno or smallest.lineno)
+                        spans.append((smallest.lineno, max(smallest.lineno, h_end)))
+                    else:
+                        spans.append(_header_span(smallest))
+                else:
+                    spans.append((smallest.lineno, smallest.end_lineno or smallest.lineno))
+        else:
+            ins_ln = f_start + i1
+            best_block = None
+            for h_sp, body in blocks:
+                b_start = h_sp[0]
+                b_end = (body[-1].end_lineno or body[-1].lineno) if body else h_sp[1]
+                if b_start <= ins_ln <= b_end + 1:
+                    if best_block is None or (b_end - b_start) <= (best_block[2] - best_block[1]):
+                        best_block = (h_sp, b_start, b_end, body)
+            if best_block is None:
+                return None
+            h_sp, _, _, body = best_block
+            spans.append(h_sp)
+            before_stmt = after_stmt = None
+            for s in body:
+                s_end = s.end_lineno or s.lineno
+                if s_end < ins_ln:
+                    before_stmt = s
+                elif s.lineno >= ins_ln and after_stmt is None:
+                    after_stmt = s
+            if before_stmt is not None:
+                spans.append((before_stmt.lineno, before_stmt.end_lineno or before_stmt.lineno))
+            if after_stmt is not None:
+                spans.append((after_stmt.lineno, after_stmt.end_lineno or after_stmt.lineno))
+    return spans or None
 
 
 @dataclass
@@ -29,11 +158,18 @@ class Candidates:
     broad: int = 0
     priority: int = 0
     broken: bool = False
-    python_paths: list = field(default_factory=list)
+    python_paths: list[str] = field(default_factory=list)
 
     @property
     def mask(self):
         return self.direct | self.broad
+
+
+def numbers(mask):
+    while mask:
+        low = mask & -mask
+        yield low.bit_length() - 1
+        mask ^= low
 
 
 class Analyzer:
@@ -68,16 +204,20 @@ class Analyzer:
             for child in children:
                 self.dialects[dialect] |= mentions.get(child, 0)
 
-    @lru_cache(maxsize=32)
+    @lru_cache(maxsize=None)
     def old(self, path):
         cache = self.maps / "ast" / (path + ".bin")
         if cache.is_file():
             return marshal.loads(cache.read_bytes())
-        old = self.base / path
-        source = old.read_bytes() if old.is_file() else b""
+        source = (self.base / path).read_bytes()
         return snapshot(ast.parse(source, path), source)
 
-    @lru_cache(maxsize=16)
+    @lru_cache(maxsize=64)
+    def old_tree_and_lines(self, path):
+        source = (self.base / path).read_bytes()
+        return ast.parse(source, path), source.splitlines()
+
+    @lru_cache(maxsize=32)
     def line_hits(self, path):
         cache = self.maps / "ast" / (path + ".lines")
         return marshal.loads(cache.read_bytes()) if cache.is_file() else {}
@@ -118,12 +258,10 @@ class Analyzer:
                 out.broad |= self.index["dirs"].get(directory.as_posix(), 0)
             if p.suffix == ".py":
                 out.python_paths.append(path)
-                self.python(path, new, out)
-                if prioritize and not out.broken:
-                    out.priority |= self.changed_line_hits(path, new)
+                self.python(path, new, out, prioritize=prioritize)
         return out
 
-    def python(self, path, new, out):
+    def python(self, path, new, out, *, prioritize=False):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
@@ -131,6 +269,7 @@ class Analyzer:
             # ast.parse alone accepts constructs such as return outside a function.
             compile(new, path, "exec", dont_inherit=True)
             tree = ast.parse(new, path)
+            new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
             out.broken = True
@@ -139,6 +278,20 @@ class Analyzer:
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
+        if dirty:
+            # Class/module-level edits that sit entirely inside lambda bodies (e.g. entries of
+            # Parser.FUNCTIONS / Generator.TRANSFORMS dicts) are code, not data: a lambda body runs
+            # at call time, so per-test line coverage of those lines names every caller.
+            base_src = (self.base / path).read_bytes() if (self.base / path).is_file() else b""
+            _, old_masked = snapshot(_MaskLambdas().visit(ast.parse(base_src, path)), base_src)
+            _, new_masked = snapshot(_MaskLambdas().visit(ast.parse(new, path)), new)
+            lambda_only = {q for q in dirty if q in old_masked and q in new_masked
+                           and not scope_changed(old_masked[q], new_masked[q])}
+            if lambda_only:
+                dirty -= lambda_only
+                l_hits = self.line_hits(path)
+                for ln in _changed_old_lines(base_src, new):
+                    out.direct |= l_hits.get(ln, 0)
         hits = self.index["by_func"].get(path, {})
         runtime = self.index["runtime"].get(path, 0)
         test_file = path.startswith("tests/")
@@ -149,8 +302,28 @@ class Analyzer:
                 continue
             changed = True
             owner, _, method = q.rpartition(".")
-            if old:
+            if old and revised and old[1] == revised[1]:
+                # Only function body changed: use statement-level granularity
+                old_tree, old_lines = self.old_tree_and_lines(path)
+                fn_old = _get_func_node(old_tree, q)
+                fn_new = _get_func_node(new_tree_for_stmts, q)
+                spans = _changed_stmt_spans(fn_old, old_lines, new.splitlines(), fn_new)
+                l_hits = self.line_hits(path)
+                if spans and l_hits:
+                    stmt_mask = 0
+                    for s_start, s_end in spans:
+                        for ln in range(s_start, s_end + 1):
+                            stmt_mask |= l_hits.get(ln, 0)
+                    out.direct |= stmt_mask
+                else:
+                    out.direct |= hits.get(q, 0)
+            elif old:
+                # Def header changed or function deleted: all tests executing any line of function body
                 out.direct |= hits.get(q, 0)
+                if not revised:
+                    l_hits = self.line_hits(path)
+                    for ln in range(old[3], old[4] + 1):
+                        out.direct |= l_hits.get(ln, 0)
             else:
                 same = self.index["by_name"].get(method.split("#")[0], 0)
                 out.broad |= (same & runtime) or same
@@ -167,24 +340,56 @@ class Analyzer:
                 if method in {"setUp", "tearDown", "setUpClass", "tearDownClass",
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
-        if changed or dirty:
-            # Process-wide heap assertions can see allocations from imported
-            # modules even when the test never calls the edited function.
-            out.broad |= self.index["heap_observers"] & self.importers[path]
+        if prioritize and (changed or dirty):
+            out.priority |= self.changed_line_hits(path, new)
         if not dirty:
             return
+        # A heap observer is a candidate if it executes the changed code (normal coverage rule),
+        # or the change is module-level/class-level in a module it imports, or the module is broken.
+        heap = self.index["heap_observers"] & self.importers[path]
+        if not (path.startswith(("sqlglot/dialects/", "sqlglot/generators/")) or path == "sqlglot/generator.py"):
+            # Heap observers only see allocations made while they run. Data edits elsewhere reach them
+            # only through code they execute (runtime coverage of this module). test_generator_memory
+            # builds every dialect's generator, so dialect/generator modules stay included.
+            heap &= runtime
+        out.broad |= heap
         if test_file:
             for owner in dirty:
                 affected = self.class_tests[path + "::" + owner] if owner else 0
                 out.broad |= affected or (self.file_tests[path] | coverage | self.importers[path])
             return
+        class_usage = self.index.get("class_usage", {})
+        # Class-usage refinement is only trusted for Expression node classes: they are created per
+        # parse (so per-test instantiation records are reliable) and their class data (arg_types,
+        # flags) is read through instances or the generator's `<key>_sql` dispatch. Other classes
+        # (tokenizer/parser/generator/dialect cores) have cached or import-time instances whose use
+        # is invisible to per-test records (corpus c1/5xwe: TokenizerCore.__slots__), so they keep the
+        # conservative rule below.
+        if "" not in dirty and class_usage and path.startswith("sqlglot/expressions/"):
+            matched_all = True
+            cls_mask = 0
+            for owner in dirty:
+                key = f"{path}::{owner}"
+                if key in class_usage:
+                    cls_mask |= class_usage[key]
+                    cls_mask |= self.index["by_name"].get(owner.split(".")[-1].lower() + "_sql", 0)
+                    # Tests that ran methods defined on this class (not the whole module: core.py
+                    # defines the Expression base used by every test).
+                    for q, mask in hits.items():
+                        if q.startswith(owner + "."):
+                            cls_mask |= mask
+                else:
+                    matched_all = False
+                    break
+            if matched_all:
+                out.broad |= cls_mask
+                return
         dialect = Path(path).stem
         out.broad |= runtime
         if path.startswith("sqlglot/") and dialect in self.dialects:
             out.broad |= self.dialects[dialect] | self.index["lazy_imports"].get(path, 0)
         else:
-            # Class data can be read through inherited functions defined in
-            # other modules, including while dependent modules are imported.
+            # Module-level non-class data changes keep the conservative rule.
             out.broad |= coverage | self.importers[path]
 
 
@@ -208,15 +413,39 @@ def main():
         print(json.dumps({"commit": patch.stem, "candidates": candidates}))
         if args.check:
             failing = set(answers[patch.stem]["failing"])
-            missing = failing.difference(candidates)
+            missing = sorted(failing - set(candidates))
             if missing:
-                print(f"miss {patch.stem}: {[(n, analyzer.ids[n]) for n in sorted(missing)]}", file=sys.stderr)
+                print(f"miss {patch.stem}: {[(n, analyzer.ids[n]) for n in missing]}", file=sys.stderr)
             failures += len(failing)
             selected += len(candidates)
             hits += len(failing) - len(missing)
     if args.check:
         print(f"recall={hits}/{failures} precision={hits}/{selected}", file=sys.stderr)
         return int(hits != failures)
+
+
+
+
+class _MaskLambdas(ast.NodeTransformer):
+    """Replace every lambda with a constant so scope signatures ignore lambda-internal edits."""
+
+    def visit_Lambda(self, node):
+        return ast.copy_location(ast.Constant(value="<lambda>"), node)
+
+
+def _changed_old_lines(old_bytes, new_bytes):
+    """Old-file line numbers (1-based) touched by the edit; pure insertions map to both neighbours."""
+    old = old_bytes.splitlines()
+    new = new_bytes.splitlines() if isinstance(new_bytes, (bytes, bytearray)) else new_bytes.encode().splitlines()
+    lines = set()
+    for op, i1, i2, _, _ in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        if i1 == i2:
+            lines.update((i1, i1 + 1))
+        else:
+            lines.update(range(i1 + 1, i2 + 1))
+    return lines
 
 
 if __name__ == "__main__":

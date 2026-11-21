@@ -5,11 +5,38 @@ import json
 import os
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from .collect import MAPS
+
+
+def _invoke(function, /, *args, **kwargs):
+    return function(*args, **kwargs)
+
+
+def _activate(label):
+    os.environ["BR_AUDIT_TEST"] = label
+    return _invoke
+
+
+class _TaskContext:
+    def __init__(self, label):
+        self.label = label
+
+    def __reduce__(self):
+        return _activate, (self.label,)
+
+
+def _tag_pool_tasks():
+    original = ProcessPoolExecutor.submit
+
+    def submit(pool, function, /, *args, **kwargs):
+        return original(pool, _TaskContext(os.environ.get("BR_AUDIT_TEST", "")), function, *args, **kwargs)
+
+    ProcessPoolExecutor.submit = submit
 
 
 class Context:
@@ -38,6 +65,7 @@ def main():
     tests = json.loads(Path("/data/tests.json").read_bytes())["tests"]
     with gzip.open(MAPS / "reads.json.gz") as source:
         reads = json.load(source)
+    _tag_pool_tasks()
     opts = ["tests", "-q", "--tb=short", "-p", "no:cacheprovider"]
     if pytest.main(opts, plugins=[Context()]):
         raise RuntimeError("baseline pytest failed")
@@ -62,7 +90,7 @@ def main():
         for n in numbers:
             test = tests[n]["id"]
             scopes = {test, test.rsplit("::", 1)[0], tests[n]["file"]}
-            if imports[path] & scopes and not data[path] & scopes:
+            if not data[path] & scopes:
                 removed.append(n)
         if removed:
             excluded[path] = removed

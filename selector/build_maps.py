@@ -70,9 +70,11 @@ def build():
         dirs[path] |= bits(ns)
 
     lazy = json.loads((MAPS / "runtime_imports.json").read_bytes())
+    class_usage = marshal.loads((MAPS / "class_usage").read_bytes()) if (MAPS / "class_usage").is_file() else {}
     index = dict(all_hits=all_hits, runtime=runtime, by_func=by_func, by_name=dict(by_name),
                  reads=reads, dirs=dict(dirs), heap_observers=bits(lazy["heap_observers"]),
-                 lazy_imports={p: bits(ns) for p, ns in lazy["imports"].items()})
+                 lazy_imports={p: bits(ns) for p, ns in lazy["imports"].items()},
+                 class_usage=class_usage)
     for name in ("collect_imports", "collection_reads", "dialect_mentions", "durations"):
         index[name] = json.loads((MAPS / (name + ".json")).read_bytes())
     (MAPS / "index.bin").write_bytes(marshal.dumps(index))
