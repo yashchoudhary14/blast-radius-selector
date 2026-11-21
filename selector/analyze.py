@@ -18,11 +18,13 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
+from .comment_cases import unchanged_stress_case
 from .config_edits import added_methods, configuration_changes
-from .core_headers import inert_header, only_nested_definitions, shared_core
+from .core_headers import (inert_header, only_nested_definitions, private_constants,
+                           retired_dialect_bindings, schema_methods, shared_core)
 from .dialect_cases import isolated_test_methods
 from .operands import narrow
-from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
+from .query_cases import MAX_NODES, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
@@ -153,7 +155,7 @@ def _collect_blocks_and_stmts(func_node):
     return blocks, stmts
 
 
-def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node, *, skip_header=False):
+def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node, *, skip_header=False, skip_blank=False):
     if func_node is None or new_func_node is None:
         return None
     f_start = min([func_node.lineno, *(d.lineno for d in func_node.decorator_list)])
@@ -181,6 +183,8 @@ def _changed_stmt_spans(func_node, old_lines, new_lines, new_func_node, *, skip_
                     return [(f_start, f_end)]
                 enclosing = [s for s in stmts if s.lineno <= ln <= (s.end_lineno or s.lineno)]
                 if not enclosing:
+                    if skip_blank and not old_lines[ln - 1].strip():
+                        continue
                     return None
                 smallest = min(enclosing, key=lambda s: (s.end_lineno or s.lineno) - s.lineno)
                 if isinstance(smallest, (*COMPOUND, ast.ExceptHandler)):
@@ -285,6 +289,15 @@ def changes_frame_bindings(before, after):
     old_locals, new_locals = set(before.co_varnames), set(after.co_varnames)
     return (not (new_locals - old_locals).isdisjoint(before.co_names)
             or not (old_locals - new_locals).isdisjoint(after.co_names))
+
+
+def removed_cells(before, after):
+    """A deleted closure may leave its captured variables as ordinary locals."""
+    if before is None or after is None or before.co_flags != after.co_flags:
+        return False
+    old_cells, new_cells = set(before.co_cellvars), set(after.co_cellvars)
+    return (new_cells < old_cells and before.co_freevars == after.co_freevars
+            and set(before.co_varnames) | old_cells == set(after.co_varnames) | new_cells)
 
 
 def interpreter_settings(source):
@@ -529,18 +542,25 @@ class Analyzer:
             mask |= hits.get(q, 0)
         return mask
 
-    def _argument_readers(self, name):
-        """Ignore uses that only call the existing callable with zero arguments."""
+    def _argument_readers(self, name, *, removed_keywords=()):
+        """Keep call sites whose argument binding can change and escaping references."""
         mask = 0
         for path, lines in self.state_refs.refs.get(name, {}).items():
             tree, _ = self.old_tree_and_lines(path)
-            empty_calls = {node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
-                           and not node.args and not node.keywords}
+            safe_calls = {node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
+                          and (all(kw.arg is not None and kw.arg not in removed_keywords for kw in node.keywords)
+                               if removed_keywords else not node.args and not node.keywords)}
             safe, other = set(), set()
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute) and node.attr == name:
-                    target = safe if node in empty_calls else other
+                    target = safe if node in safe_calls else other
                     target.update((node.lineno, node.end_lineno))
+                elif removed_keywords and ((isinstance(node, ast.Name) and node.id == name and node in safe_calls)
+                                            or (isinstance(node, ast.alias) and node.name == name
+                                                and node.asname in (None, name))):
+                    # The function still exists. Unaliased direct imports
+                    # continue to bind it; subsequent uses are covered here.
+                    safe.add(node.lineno)
                 elif ((isinstance(node, ast.Name) and node.id == name)
                       or (isinstance(node, ast.Constant) and node.value == name)
                       or (isinstance(node, ast.alias) and node.name == name)):
@@ -956,6 +976,13 @@ class Analyzer:
                 self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
                             operand_safe=production_count == 1)
         out.query_subsets = self.queries.subsets(out, edits)
+        stress = self.num.get(MAX_NODES)
+        if (stress in self.queries.maps and stress not in out.query_subsets and not out.broken
+                and out.mask & ~out.query_blocked & (1 << stress)
+                and production_count
+                and edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}
+                and unchanged_stress_case(self, edits, out, stress)):
+            out.query_subsets[stress] = []
         return out
 
     @lru_cache(maxsize=1)
@@ -1320,6 +1347,25 @@ class Analyzer:
         new_funcs, new_scopes = snapshot(tree, new, old_funcs)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
+        if dirty and path == "sqlglot/dialects/dialect.py":
+            original = (self.base / path).read_bytes()
+            if _same_directives_text_only(original, new):
+                bindings = retired_dialect_bindings(original, new)
+                if bindings:
+                    removed_lines = {line for nodes in bindings.values() for node in nodes
+                                     for line in range(node.lineno, node.end_lineno + 1)}
+                    for name, nodes in bindings.items():
+                        for ref_path, lines in self.state_refs.refs.get(name, {}).items():
+                            affected = set(lines) - removed_lines if ref_path == path else lines
+                            out.broad |= self._lines_and_indirect_mask(ref_path, affected)
+                        if nodes and isinstance(nodes[0], ast.FunctionDef):
+                            out.direct |= self._func_mask(path, ("Dialect." + name,))
+                    out.broad |= (self.location_observers() | self.state_refs.mask("*module")
+                                  | self.state_refs.mask("__annotations__"))
+                    out.broad |= self.index["heap_observers"] & self.importers[path]
+                    out.query_spans = None
+                    out.dialect_subset_safe = False
+                    return
         dialect_code = (path in {"sqlglot/parser.py", "sqlglot/generator.py"}
                         or path.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/")))
         if self.dict_reads and not diagnostics and dirty and dialect_code:
@@ -1379,6 +1425,16 @@ class Analyzer:
                 out.broad |= self.state_refs.mask("__annotations__") & self.binding_users(path)
                 for field in configuration:
                     out.broad |= self.state_refs.mask(field) & self.binding_users(path)
+        if single_edit and dirty == {""} and path == "sqlglot/expressions/core.py":
+            original = (self.base / path).read_bytes()
+            if _same_directives_text_only(original, new):
+                configuration = private_constants(original, new)
+                if configuration:
+                    dirty.clear()
+                    out.broad |= self.location_observers() | self.state_refs.mask("__annotations__")
+                    out.broad |= self.index["heap_observers"] & self.importers[path]
+                    for field in configuration:
+                        out.broad |= self.state_refs.mask(field)
         scope_edit = bool(dirty)
         plain_methods = set()
         if (path in {"sqlglot/parser.py", "sqlglot/generator.py"} and not scope_edit
@@ -1399,6 +1455,15 @@ class Analyzer:
                     if path == "sqlglot/generator.py" and name.endswith("_sql") and not name.startswith("_"):
                         observers |= self.expression_keys().get(name[:-4], 0)
                 out.broad |= observers
+        if path == "sqlglot/schema.py" and not scope_edit and old_funcs.keys() != new_funcs.keys():
+            original = (self.base / path).read_bytes()
+            if _same_directives_text_only(original, new):
+                plain_methods = schema_methods(original, new, old_funcs, new_funcs)
+                if plain_methods:
+                    out.broad |= self.location_observers() | self._dynamic_other_mask()
+                    out.broad |= self.index["heap_observers"] & self.importers[path]
+                    for name in plain_methods:
+                        out.broad |= self.state_refs.mask(name)
         if old_scopes != new_scopes or old_funcs.keys() != new_funcs.keys():
             out.query_spans = None
         if dirty:
@@ -1447,6 +1512,7 @@ class Analyzer:
             return pinned_layout(self.base, path) == frame_layout(compiled)
 
         safe_headers = {}
+        removed_keywords = {}
         if shared_core(path) and not scope_edit:
             changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
                                if old_funcs[q][1] != new_funcs[q][1]]
@@ -1461,6 +1527,11 @@ class Analyzer:
                         kind = inert_header(fn_old, fn_new, before.co_flags, compiled.co_flags)
                         if kind:
                             safe_headers[q] = kind
+                            if kind == "remove" and "." not in q:
+                                omitted = {arg.arg for arg in fn_old.args.kwonlyargs}
+                                omitted.difference_update(arg.arg for arg in fn_new.args.kwonlyargs)
+                                if omitted:
+                                    removed_keywords[q] = omitted
                             h0, h1 = _header_span(fn_old)
                             header_skip.update(range(h0, h1 + 1))
 
@@ -1493,7 +1564,8 @@ class Analyzer:
                     old_code = self.old_code(path).get(q)
                     suspended = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
                     if kind == "add" or old_code is None or old_code.co_flags & suspended:
-                        observers |= self._argument_readers(method.split("#")[0])
+                        observers |= self._argument_readers(method.split("#")[0],
+                                                            removed_keywords=removed_keywords.get(q, ()))
                 out.direct |= observers
                 out.query_blocked |= observers
             if bool(old) != bool(revised):
@@ -1525,17 +1597,27 @@ class Analyzer:
                 # A local introduced on an untaken branch can rebind a name
                 # throughout the frame. Include callers of unaffected lines too.
                 frame_changed = False
+                relocated_cells = False
                 if not same_layout():
                     if code is None:
                         code = functions(compiled)
-                    frame_changed = changes_frame_bindings(self.old_code(path).get(q), code.get(q))
+                    old_frame, new_frame = self.old_code(path).get(q), code.get(q)
+                    frame_changed = changes_frame_bindings(old_frame, new_frame)
+                    if (frame_changed and shared_core(path) and removed_cells(old_frame, new_frame)):
+                        frame_changed = False
+                        relocated_cells = True
+                        observers = self.location_observers() | self.state_refs.mask("locals")
+                        for name in ("co_varnames", "co_freevars", "co_cellvars", "__closure__", "f_locals"):
+                            observers |= self.state_refs.mask(name)
+                        out.broad |= observers & self.importers[path]
                 if safe_headers and same_layout():
                     children = {child.rsplit(".", 1)[-1] for child, child_kind in safe_headers.items()
                                 if child.rpartition(".")[0] == q and child_kind == "annotation"}
                     if (kind or children) and only_nested_definitions(fn_old, fn_new, children):
                         continue
                 spans = None if frame_changed else _changed_stmt_spans(
-                    fn_old, old_lines, new.splitlines(), fn_new, skip_header=kind == "annotation"
+                    fn_old, old_lines, new.splitlines(), fn_new, skip_header=kind == "annotation",
+                    skip_blank=relocated_cells,
                 )
                 if out.query_spans is not None:
                     safe = body_spans(fn_old, fn_new, spans)
