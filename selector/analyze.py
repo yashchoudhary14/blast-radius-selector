@@ -212,6 +212,17 @@ def collection_actions(source):
     return tuple(ast.dump(stmt) for stmt in body if writes(stmt))
 
 
+def changes_frame_bindings(before, after):
+    if before is None or after is None:
+        return True
+    if (before.co_flags != after.co_flags or before.co_freevars != after.co_freevars
+            or before.co_cellvars != after.co_cellvars):
+        return True
+    old_locals, new_locals = set(before.co_varnames), set(after.co_varnames)
+    return (not (new_locals - old_locals).isdisjoint(before.co_names)
+            or not (old_locals - new_locals).isdisjoint(after.co_names))
+
+
 class Analyzer:
     def __init__(self, manifest, base=Path("/sqlglot"), maps=Path("/app/maps")):
         self.base, self.maps = base, maps
@@ -358,6 +369,10 @@ class Analyzer:
     def code_signatures(self, path):
         cache = self.maps / "ast" / (path + ".code")
         return marshal.loads(cache.read_bytes()) if cache.is_file() else {}
+
+    @lru_cache(maxsize=32)
+    def old_code(self, path):
+        return functions(compile((self.base / path).read_bytes(), path, "exec", dont_inherit=True))
 
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None):
         out = Candidates()
@@ -611,6 +626,11 @@ class Analyzer:
         header_skip = set()
         changed_symbols = set()
         mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
+
+        @lru_cache(maxsize=1)
+        def same_layout():
+            return pinned_layout(self.base, path) == frame_layout(compiled)
+
         for q in old_funcs.keys() | new_funcs.keys():
             old, revised = old_funcs.get(q), new_funcs.get(q)
             if old and revised and old[2] == revised[2]:
@@ -642,7 +662,14 @@ class Analyzer:
                     changed_symbols.add((mod_name, method.split("#")[0]))
                 elif owner in old_scopes:
                     changed_symbols.add((f"{mod_name}.{owner}", method.split("#")[0]))
-                spans = _changed_stmt_spans(fn_old, old_lines, new.splitlines(), fn_new)
+                # A local introduced on an untaken branch can rebind a name
+                # throughout the frame. Include callers of unaffected lines too.
+                frame_changed = not same_layout() and changes_frame_bindings(
+                    self.old_code(path).get(q), code.get(q)
+                )
+                spans = None if frame_changed else _changed_stmt_spans(
+                    fn_old, old_lines, new.splitlines(), fn_new
+                )
                 if out.query_spans is not None:
                     safe = body_spans(fn_old, fn_new, spans)
                     if safe:
@@ -657,8 +684,7 @@ class Analyzer:
                             stmt_mask |= l_hits.get(ln, 0)
                     if stmt_mask and operand_safe:
                         stmt_mask = ((stmt_mask & self.index["heap_observers"]) |
-                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits,
-                                            lambda: pinned_layout(self.base, path) == frame_layout(compiled)))
+                                     narrow(self.maps, path, fn_old, fn_new, stmt_mask, l_hits, same_layout))
                     out.direct |= stmt_mask
                 else:
                     out.direct |= hits.get(q, 0)
@@ -688,8 +714,7 @@ class Analyzer:
                 if method in {"setUp", "tearDown", "setUpClass", "tearDownClass",
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
-        if (out.query_spans and path in out.query_spans
-                and pinned_layout(self.base, path) != frame_layout(compiled)):
+        if out.query_spans and path in out.query_spans and not same_layout():
             out.query_spans = None
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
