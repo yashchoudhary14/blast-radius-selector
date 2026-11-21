@@ -418,7 +418,7 @@ class Analyzer:
     def old_code(self, path):
         return functions(compile((self.base / path).read_bytes(), path, "exec", dont_inherit=True))
 
-    def analyze(self, patch, *, prioritize=False, session=None, deadline=None):
+    def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
         for directory in edits.removed_dirs:
@@ -426,7 +426,11 @@ class Analyzer:
         from runner import Session
         @lru_cache(maxsize=1)
         def state():
-            end = min(time.monotonic() + 5, deadline or float("inf"))
+            now = time.monotonic()
+            if (not allow_probe or (run_until is not None and now >= run_until)
+                    or (deadline is not None and now >= deadline)):
+                return "unknown", []
+            end = min(now + 5, deadline or float("inf"))
             if session:
                 result = session().import_state(edits, end)
             else:
@@ -437,9 +441,12 @@ class Analyzer:
                   file=sys.stderr)
             return status, rows
 
-        probe = state if all(p.startswith("sqlglot/") and p.endswith(".py")
-                             and p != "sqlglot/__main__.py" and data is not None
-                             and (self.base / p).is_file() for p, data in edits.items()) else None
+        probe = state if (allow_probe
+                          and (run_until is None or time.monotonic() < run_until)
+                          and (deadline is None or time.monotonic() < deadline)
+                          and all(p.startswith("sqlglot/") and p.endswith(".py")
+                                  and p != "sqlglot/__main__.py" and data is not None
+                                  and (self.base / p).is_file() for p, data in edits.items())) else None
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)

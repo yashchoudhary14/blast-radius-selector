@@ -92,7 +92,7 @@ class Execution:
                 return remaining | potential_observers
             return remaining
 
-        if get_session is None:
+        if get_session is None or time.monotonic() >= deadline:
             return conservative(selected)
         if len(selected) == 1 and not candidates.python_paths:
             # A single direct data reader can save only its own worker on a pass.

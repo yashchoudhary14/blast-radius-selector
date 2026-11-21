@@ -4,8 +4,9 @@ import argparse
 import json
 import math
 import os
+import select
+import signal
 import sys
-import tempfile
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -24,9 +25,9 @@ def record(commit, workers):
     return json.dumps({"commit": commit, "workers": workers}, separators=(",", ":"))
 
 
-def lane(execution, millis, patches, output, start, deadline, static, fallback):
+def lane(execution, millis, patches, dst, start, deadline, static, fallback):
     all_workers, all_cost = fallback
-    with output.open("w", buffering=1) as dst, ExitStack() as stack:
+    with ExitStack() as stack:
         runner = None
 
         def session():
@@ -50,8 +51,14 @@ def lane(execution, millis, patches, output, start, deadline, static, fallback):
             begin = cpu_time()
             try:
                 patch = path.read_bytes().decode("utf-8", "surrogateescape")
-                candidates = execution.analyzer.analyze(patch, prioritize=not guarded,
-                                                        session=session, deadline=deadline)
+                candidates = execution.analyzer.analyze(
+                    patch,
+                    prioritize=not guarded,
+                    session=None if guarded else session,
+                    deadline=deadline,
+                    run_until=None if static else run_until,
+                    allow_probe=not guarded,
+                )
                 selected = execution.select(None if guarded else session, path.stem, patch,
                                             candidates, run_until, log)
                 workers, cost = schedule(selected, millis)
@@ -94,10 +101,12 @@ def main():
     paths = sorted((args.data / "commits").glob("*.patch"))
     manifest = args.data / "tests.json"
     static = args.static or os.getenv("SELECTOR_STATIC") == "1"
-    # A 30-commit practice batch has 180 s, a final batch about 45 has 270 s.
-    # Keep the shorter cap for ambiguous intermediate sizes.
-    limit = 270 if len(paths) >= 45 else 180
-    deadline = start + min(6 * len(paths), limit) - 3
+    # A 30-commit practice batch has 180 s, a final batch (~45-60) has 270 s.
+    # Larger local evaluation batches (e.g. c2 with 300 commits) run under 180 s.
+    limit = 270 if 45 <= len(paths) <= 120 else 180
+    margin = max(8.0, 0.04 * limit)
+    hard_deadline = start + limit - margin
+    deadline = min(start + max(10.0, 6.0 * len(paths)) - 3.0, hard_deadline - 2.0)
     try:
         mark = time.process_time()
         analyzer = Analyzer(manifest)
@@ -114,48 +123,90 @@ def main():
         try:
             execution = Execution(analyzer, tests, millis)
             log(f"map_load_cpu={time.process_time()-mark:.6f}")
-            if paths and not static:
+            if paths and not static and time.monotonic() < deadline:
                 warm()
         except Exception as exc:
             log(f"fallback startup {exc!r}")
             execution = None
-    if execution is None:
+    if execution is None or time.monotonic() >= hard_deadline:
+        if execution is not None:
+            log("fallback startup deadline")
         for path in paths:
             print(record(path.stem, fallback[0]))
         paths = []
     log(f"startup_cpu={time.process_time():.6f}")
-    with tempfile.TemporaryDirectory() as tmp:
-        jobs = []
+    if paths:
+        active = {}
+        emitted = set()
+        expected = {path.stem for path in paths}
         for index in range(min(2, len(paths))):
-            output = Path(tmp) / str(index)
+            rd, wr = os.pipe()
             batch = paths[index::2]
             pid = os.fork()
             if not pid:
+                os.setpgid(0, 0)
+                os.close(rd)
+                for other_rd in active:
+                    os.close(other_rd)
                 os.dup2(2, 1)
                 try:
-                    lane(execution, millis, batch, output, start, deadline, static, fallback)
+                    with os.fdopen(wr, "w", buffering=1, encoding="utf-8") as dst:
+                        lane(execution, millis, batch, dst, start, deadline, static, fallback)
                 except BaseException as exc:
                     log(f"lane {index} {exc!r}")
                     os._exit(1)
                 os._exit(0)
-            jobs.append((pid, batch, output))
-        for pid, batch, output in jobs:
-            os.waitpid(pid, 0)
-            emitted = set()
-            if output.exists():
-                for line in output.read_text().splitlines():
+            try:
+                os.setpgid(pid, pid)
+            except OSError:
+                pass
+            os.close(wr)
+            active[rd] = [pid, bytearray()]
+        while active and time.monotonic() < hard_deadline:
+            timeout = max(0.0, hard_deadline - time.monotonic())
+            ready, _, _ = select.select(list(active), [], [], timeout)
+            if not ready:
+                break
+            for fd in ready:
+                chunk = os.read(fd, 65536)
+                pid, buf = active[fd]
+                if not chunk:
+                    os.close(fd)
+                    del active[fd]
+                    os.waitpid(pid, 0)
+                    continue
+                buf.extend(chunk)
+                *lines, tail = buf.split(b"\n")
+                active[fd][1] = bytearray(tail)
+                for raw in lines:
                     try:
-                        emitted.add(json.loads(line)["commit"])
-                    except (ValueError, KeyError):
+                        text = raw.decode("utf-8")
+                        commit = json.loads(text)["commit"]
+                    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
                         continue
-                    print(line)
-            for path in batch:
-                if path.stem not in emitted:
-                    log(f"fallback {path.stem} incomplete lane")
-                    print(record(path.stem, fallback[0]))
+                    if commit in expected and commit not in emitted:
+                        emitted.add(commit)
+                        print(text, flush=True)
+        if active:
+            missing = len(paths) - len(emitted)
+            log(f"watchdog deadline limit={limit} missing={missing}")
+            for fd, (pid, _) in list(active.items()):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(fd)
+                os.waitpid(pid, 0)
+        for path in paths:
+            if path.stem not in emitted:
+                emitted.add(path.stem)
+                log(f"fallback {path.stem} incomplete lane")
+                print(record(path.stem, fallback[0]))
     sys.stdout.flush()
-    usage = dict(line.split() for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines())
-    log(f"CPU_USEC={usage['usage_usec']}")
+    stat_path = Path("/sys/fs/cgroup/cpu.stat")
+    if stat_path.is_file():
+        usage = dict(line.split() for line in stat_path.read_text().splitlines())
+        log(f"CPU_USEC={usage['usage_usec']}")
 
 
 if __name__ == "__main__":
