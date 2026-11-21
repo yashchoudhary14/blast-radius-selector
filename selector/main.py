@@ -93,10 +93,11 @@ def main():
     paths = sorted((args.data / "commits").glob("*.patch"))
     manifest = args.data / "tests.json"
     static = args.static or os.getenv("SELECTOR_STATIC") == "1"
-    # Practice: ~30 commits in 180 s. Final: ~1.5x commits in 270 s. Infer the limit from the batch
-    # size and keep a safety margin; never plan past it.
-    limit = 180 if len(paths) <= 36 else 270
-    deadline = start + min(5.2 * len(paths), limit - 18)
+    # Practice: 40 commits in 180 s (measured: baseline 1614.1 s = 40 x 40.35 s). Final: ~1.5x commits
+    # (~60) in 270 s. Both are 4.5 s per commit. Plan for 4.0 s per commit and never past the
+    # smaller limit unless the batch is clearly final-sized.
+    limit = 180 if len(paths) <= 48 else 270
+    deadline = start + min(4.0 * len(paths), limit - 20)
     try:
         mark = time.process_time()
         analyzer = Analyzer(manifest)
