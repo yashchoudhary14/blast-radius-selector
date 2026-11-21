@@ -52,7 +52,8 @@ def lane(execution, millis, patches, output, start, deadline, static, fallback):
             begin = cpu_time()
             try:
                 patch = path.read_bytes().decode("utf-8", "surrogateescape")
-                candidates = execution.analyzer.analyze(patch, prioritize=not guarded)
+                candidates = execution.analyzer.analyze(patch, prioritize=not guarded,
+                                                        session=session, deadline=deadline)
                 selected = execution.select(None if guarded else session, path.stem, patch,
                                             candidates, run_until, log)
                 workers, cost = schedule(selected, millis)

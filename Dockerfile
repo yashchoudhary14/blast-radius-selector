@@ -39,6 +39,8 @@ if not directory_reads.exists():
 PY
 RUN python -m selector.collect && python -m runner.dependencies && python -m selector.build_maps && \
     python -m compileall -q /app && chmod -R a+rX /sqlglot /app
+ENV PYTHONHASHSEED=0
+RUN python -m runner.state && python -m runner.state --calibrate && python -m selector.state_refs
 ENV SELECTOR_STATIC=1
 CMD ["python", "-m", "selector.main"]
 

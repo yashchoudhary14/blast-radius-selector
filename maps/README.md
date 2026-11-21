@@ -49,3 +49,9 @@ The separate file-read and import maps retain their original collection order. T
 Use `powershell -NoProfile -ExecutionPolicy Bypass -File lab/coverage/rebuild.ps1 -ImportsOnly` to rebuild just the import map. A fresh interpreter switches coverage contexts on entry to each pinned source loader and restores the enclosing context on return. It resolves all dialects, constructs their tokenizer/parser/generator, and imports the package and test trees. Only work during module execution receives a module owner. The builder also measures cold fills and warm lookups for the generator dispatch table and the dialect class registry. It exercises registry lookup by name, subscript, and enumeration with the pinned dialect modules loaded. At selection time, cold-only lines inherit the numbered tests and module importers that reached a warm lookup.
 
 `lab/coverage/check_recall.py` reports the union size and missing test numbers for each sample commit. It uses exact old lines for deletions and replacements. For added lines it includes the closest covered line in the same revised function with a corresponding old coordinate, including both neighbors on a tie. It unions file readers for non-Python paths. Precision and recall use total commit–test pairs. Module-level impact beyond measured execution and changes to previously unexecuted paths can produce misses.
+
+The state selector builds its production snapshot, bytecode signatures and source references in the image. Its checked-in key map records passing test methods that reached individual lookup sites in the pinned source. To regenerate it from this worktree in PowerShell, run
+
+```powershell
+docker run --rm --cpus 4 --network none -v "${PWD}/../sample/sample/tests.json:/data/tests.json:ro" -v "${PWD}/maps/key-reads.bin:/app/maps/key-reads.bin" br-q python -m selector.key_reads
+```
