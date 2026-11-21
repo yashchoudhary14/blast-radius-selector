@@ -1,0 +1,4 @@
+FROM br-lab
+RUN python -m compileall -q --invalidation-mode timestamp /sqlglot/sqlglot /sqlglot/tests
+COPY . /opt/runner
+ENV PYTHONPATH=/opt:/sqlglot
