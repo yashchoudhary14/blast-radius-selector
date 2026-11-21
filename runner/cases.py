@@ -7,6 +7,7 @@ from collections import defaultdict
 from functools import wraps
 from itertools import groupby
 
+from .parser_cases import MAX_NODES, filter_parser
 from .query_cases import filter_queries
 
 
@@ -192,6 +193,8 @@ def execute(ids, deadlines, early, send, case_filter=None):
                 if case_filter and ids[idx] in case_filter:
                     if ids[idx] == GENERATOR_MEMORY:
                         filter_dialects(case, imported, case_filter[ids[idx]])
+                    elif ids[idx] == MAX_NODES:
+                        filter_parser(case, case_filter[ids[idx]])
                     else:
                         filter_queries(case, imported, ids[idx], case_filter[ids[idx]])
                 klass = type(case)

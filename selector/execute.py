@@ -9,6 +9,7 @@ from .analyze import numbers
 from .dialect_cases import DialectCases
 from .patch_proof import PatchProof
 from .proxies import can_prove_pass
+from .query_cases import MAX_NODES, TPCDS
 from .workers import schedule
 
 
@@ -33,6 +34,8 @@ class Execution:
         self.ids = {t["number"]: t["id"] for t in tests}
         self.num = {node: n for n, node in self.ids.items()}
         self.memory = self.num.get(GENERATOR_MEMORY)
+        self.catalog_cost = self.cost(millis)
+        self.heavy_cases = {self.num[test] for test in (MAX_NODES, TPCDS) if test in self.num}
         self.dialects = DialectCases(analyzer.maps)
         self.files = {t["number"]: t["file"] for t in tests}
         self.pool_tests = set(numbers(analyzer.index["by_func"].get("tests/test_optimizer.py", {}).get(
@@ -56,7 +59,7 @@ class Execution:
     def cost(self, selected):
         return schedule(selected, self.millis)[1] / 1000
 
-    def batches(self, pending):
+    def batches(self, pending, filtered):
         cheap = {n for n in pending if self.millis[n] < 500}
         heavy = pending - cheap
         groups = defaultdict(set)
@@ -67,6 +70,10 @@ class Execution:
         # Some tests cost more to run than their entire worker load. Price the
         # rest together so shared setup and the last worker fee count only once.
         yield cheap | {n for n in heavy if self.body[n] < self.millis[n] / 1000}
+        paired = pending & self.heavy_cases & filtered.keys()
+        if len(paired) > 1:
+            yield paired
+            yield paired | cheap
         for n in sorted(heavy):
             yield {n}
         yield from groups.values()
@@ -105,6 +112,10 @@ class Execution:
 
         def run_cost(batch):
             return self.run_cost(batch) - sum(discounts[n] for n in discounts if n in batch)
+
+        def emitted_cost(selection):
+            cost = self.cost(selection)
+            return cost if candidates.structural else min(cost, self.catalog_cost)
 
         subset = self.dialects.subset(candidates) if self.memory is not None else None
         if subset is not None:
@@ -148,7 +159,7 @@ class Execution:
 
         if subset is not None and self.memory in selected:
             kept = conservative(selected)
-            if .5 * (self.cost(kept) - self.cost(kept - {self.memory})) > subset_cost:
+            if .5 * (emitted_cost(kept) - emitted_cost(kept - {self.memory})) > subset_cost:
                 probe_memory()
         proof = root = None
         tried_replay = set()
@@ -201,10 +212,10 @@ class Execution:
                     f"cpu={cpu_time()-start:.6f}")
 
         def roi_cost(s):
-            c = self.cost(s)
+            c = emitted_cost(s)
             if (subset is not None and self.memory in s and self.memory not in selected
                     and self.memory not in observed and self.memory not in failed):
-                c_no_mem = self.cost(s - {self.memory})
+                c_no_mem = emitted_cost(s - {self.memory})
                 if .5 * (c - c_no_mem) > subset_cost:
                     return c_no_mem + subset_cost + 0.1 * (c - c_no_mem)
             return c
@@ -219,7 +230,7 @@ class Execution:
             # A completed passing probe gives evidence for the clean path unless a failure was seen.
             pass_chance = 0.75 if (observed and not failed) else 0.5
             seen = set()
-            for batch in self.batches(pending):
+            for batch in self.batches(pending, discounts):
                 key = frozenset(batch)
                 if not key or key in seen:
                     continue
@@ -228,7 +239,9 @@ class Execution:
                 if estimate > budget:
                     continue
                 gain = static - roi_cost(conservative(selected - batch))
-                if failed:
+                if failed or key & discounts.keys():
+                    # A case can fail after earlier selected cases completed.
+                    # Charge the filtered batch's full estimate in that event.
                     net = pass_chance * gain - estimate
                 else:
                     first = min(batch, key=rank)
@@ -263,7 +276,7 @@ class Execution:
             if best is None:
                 break
             log(f"decision {commit} batch={len(best)}/{len(pending)} est={run_cost(best):.3f} "
-                f"gain={static-self.cost(conservative(selected-best)):.3f} early={int(not failed)} budget={budget:.2f}")
+                f"gain={static-emitted_cost(conservative(selected-best)):.3f} early={int(not failed)} budget={budget:.2f}")
             root = None  # Session.run removes its overlay.
             if not run(best, not failed):
                 break
@@ -271,7 +284,7 @@ class Execution:
         if subset is not None and self.memory in selected and self.memory not in observed:
             # An additional heap observer can enter only after another probe.
             # Price this optional follow-up against its marginal schedule gain.
-            gain = self.cost(selected) - self.cost(selected - {self.memory})
+            gain = emitted_cost(selected) - emitted_cost(selected - {self.memory})
             if .5 * gain > subset_cost:
                 probe_memory()
         return selected

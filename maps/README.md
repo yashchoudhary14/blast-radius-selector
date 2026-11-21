@@ -9,7 +9,7 @@ These files describe the numbered tests at SQLGlot commit `eb11aec4be8cb2122afe7
 | `modlevel.json.gz` | `{"path.py":[line,...],...}`. Sorted lines reached while importing the pinned files in module and class definition scopes. Includes executed decorators, default expressions and definition lines. An empty list is valid. |
 | `reads.json.gz` | `{"path":[test_number,...],...}`. Each sorted list identifies tests that opened an existing file under the checkout with read access, including Python sources opened as data. |
 | `durations.json` | `{"test_number":[wall_seconds,process_cpu_seconds],...}`. Each pair measures the complete pytest protocol in a separate serial run. Wall time includes waiting for child processes. Process CPU measures the pytest process, including its threads. |
-| `query_cases.json.gz` | Each test ID maps to a fixture count, a table of integer case masks, and a per-file list of inclusive `[first_line, last_line, mask_index]` ranges. Bit zero is the first fixture. The parser limit test has one bit for its complete method. |
+| `query_cases.json.gz` | Each test ID maps to a case count, a table of integer case masks, and a per-file list of inclusive `[first_line, last_line, mask_index]` ranges. The parser limit test groups its sanity checks, two large input checks, and the reset check. |
 | `dialect-reads.json.gz` | Each test node ID or test file maps dispatch fields to the keys observed while running the pristine tests, including unsuccessful lookup attempts. A missing field or record provides no evidence. File records combine the reads of all methods in that file. |
 
 To regenerate the dispatch map in the pinned environment, run
@@ -27,6 +27,8 @@ docker rm br-r-operands
 `parameters.zip` uses the same collection and packing steps with `-e BR_PARAMETER_BUILD=1` added to `docker run`. Copy the resulting archive to `maps/parameters.zip`. Each entry site describes None and truthiness observations for one parameter. The selector uses it for a leading return or raise guard whose predicate is always false in both runs.
 
 To regenerate the query map, run this from the track directory. Use an empty cache for a fresh collection. The builder runs each fixture separately, then traces the intact loop including pool workers. It assigns shared setup, teardown and unattributed full-run lines to every fixture.
+
+`tpcds-case-cpu.json` records host CPU milliseconds for the 99 pinned cases in fixture order, including their DuckDB assertions. The selector scales their relative weights to the calibrated container CPU for the complete test and accounts for fixture setup and process startup separately.
 
 ```powershell
 docker run --rm --cpus=4 -e PYTHON_CPU_COUNT=1 -e OPENBLAS_NUM_THREADS=1 -e PYTHONPATH=/app/selector/query_build:/app:/sqlglot -v "${PWD}/entry:/app" -v "${PWD}/scratch/m/cache:/query-cache" br-lab python /app/selector/query_build/build.py

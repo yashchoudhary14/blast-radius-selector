@@ -8,11 +8,11 @@ from bisect import bisect_left
 from functools import lru_cache
 from types import CodeType
 
+from runner.parser_cases import MAX_NODES
 from runner.query_cases import EXECUTOR
 
 
 TPCDS = EXECUTOR + "test_execute_tpcds"
-MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 
 
 def dead_condition(analyzer, edits, files):
@@ -92,6 +92,12 @@ class QueryCases:
 
     def _get_tpcds_weights(self):
         if self._tpcds_weights is None:
+            calibration = self.analyzer.maps / "tpcds-case-cpu.json"
+            if calibration.is_file():
+                # The host process clock rounds short queries down to zero.
+                weights = [max(8, ms) for ms in json.loads(calibration.read_bytes())]
+                self._tpcds_weights = (weights, sum(weights))
+                return self._tpcds_weights
             fixture = self.analyzer.base / "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
             if fixture.is_file():
                 lines = [ln for ln in fixture.read_text(encoding="utf-8").splitlines()
@@ -156,6 +162,11 @@ class QueryCases:
     def body_cost(self, n, indices, execution):
         # Optimizer pool creation is already included in Execution.setup().
         node = execution.ids[n]
+        if node == MAX_NODES and self.maps[n][0] == 4:
+            # The two wide inputs dominate CPU. The smoke and reset groups
+            # use less than 0.02 host CPU seconds each.
+            weights = (.02, 23.83, 8.31, .02)
+            return execution.body[n] * sum(weights[i] for i in indices) / sum(weights)
         pool = .65 if node.startswith(EXECUTOR + "test_execute_") else 0.
         if node == TPCDS:
             weights, total = self._get_tpcds_weights()

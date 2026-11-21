@@ -63,9 +63,29 @@ def install(directory):
 
 
 def instrument(case, module, node):
+    from runner.parser_cases import MAX_NODES, parser_method
     from runner.query_cases import EXECUTOR, QUERIES
 
     method = getattr(case, case._testMethodName)
+    if node == MAX_NODES:
+        parser_method(method)
+        parse = module.parse_one
+
+        def wrapped_parser():
+            cases = iter((0, 0, 1, 2, 3, 3))
+
+            def tagged_parse(*args, **kwargs):
+                activate(next(cases))
+                try:
+                    return parse(*args, **kwargs)
+                finally:
+                    activate(-1)
+
+            with patch.object(module, "parse_one", tagged_parse):
+                return method()
+
+        setattr(case, case._testMethodName, wrapped_parser)
+        return
     futures = {}
     submit = ProcessPoolExecutor.submit
 
