@@ -18,6 +18,7 @@ from runner.overlay import changes
 from .collect import BASE, MAPS
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
+from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
 try:
@@ -183,6 +184,7 @@ def numbers(mask):
 class Analyzer:
     def __init__(self, manifest, base=Path("/sqlglot"), maps=Path("/app/maps")):
         self.base, self.maps = base, maps
+        self.state_refs = StateRefs(self)
         self.index = marshal.loads((maps / "index.bin").read_bytes())
         self.tests = json.loads(manifest.read_bytes())["tests"]
         self.ids = {t["number"]: t["id"] for t in self.tests}
@@ -295,9 +297,31 @@ class Analyzer:
                     mask |= hits.get(index, 0)
         return mask
 
-    def analyze(self, patch, *, prioritize=False):
+    @lru_cache(maxsize=32)
+    def code_signatures(self, path):
+        cache = self.maps / "ast" / (path + ".code")
+        return marshal.loads(cache.read_bytes()) if cache.is_file() else {}
+
+    def analyze(self, patch, *, prioritize=False, session=None, deadline=None):
         out = Candidates()
         edits = changes(self.base, patch)
+        from runner import Session
+        @lru_cache(maxsize=1)
+        def state():
+            end = min(time.monotonic() + 5, deadline or float("inf"))
+            if session:
+                result = session().import_state(edits, end)
+            else:
+                with Session(base=self.base, warm_fixtures=False) as child:
+                    result = child.import_state(edits, end)
+            status, rows, cpu = result
+            print(f"state {','.join(edits)} status={status} bindings={len(rows)} cpu={cpu:.4f}",
+                  file=sys.stderr)
+            return status, rows
+
+        probe = state if all(p.startswith("sqlglot/") and p.endswith(".py")
+                             and p != "sqlglot/__main__.py" and data is not None
+                             and (self.base / p).is_file() for p, data in edits.items()) else None
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
@@ -316,11 +340,11 @@ class Analyzer:
                 out.python_paths.append(path)
                 if not path.startswith("sqlglot/"):
                     out.dialect_subset_safe = False
-                self.python(path, new, out, prioritize=prioritize)
+                self.python(path, new, out, prioritize=prioritize, probe=probe)
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 
-    def python(self, path, new, out, *, prioritize=False):
+    def python(self, path, new, out, *, prioritize=False, probe=None):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
@@ -368,10 +392,25 @@ class Analyzer:
         runtime = self.index["runtime"].get(path, 0)
         test_file = path.startswith("tests/")
         changed = False
+        code = None
+        equivalent = set()
         for q in old_funcs.keys() | new_funcs.keys():
             old, revised = old_funcs.get(q), new_funcs.get(q)
             if old and revised and old[2] == revised[2]:
                 continue
+            if old and revised and old[1] == revised[1]:
+                if code is None:
+                    code = functions(compiled)
+                if code.get(q) and signature(code[q]) == self.code_signatures(path).get(q):
+                    def docs(tree):
+                        fn = _get_func_node(tree, q)
+                        return [ast.get_docstring(n, clean=False) for n in ast.walk(fn)
+                                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))] if fn else []
+                    # Actual docstring edits can affect introspection/doctests.
+                    # Preserve their normal source/statement attribution.
+                    if docs(self.old_tree_and_lines(path)[0]) == docs(new_tree_for_stmts):
+                        equivalent.update(range(old[3], old[4] + 1))
+                        continue
             changed = True
             owner, _, method = q.rpartition(".")
             if old and revised and old[1] == revised[1]:
@@ -424,6 +463,27 @@ class Analyzer:
             out.query_spans = None
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
+        refined = None
+        if dirty and scope_edit and probe:
+            status, rows = probe()
+            if status == "broken":
+                out.broken = True
+                out.broad |= coverage | self.importers[path]
+                return
+            if status == "ok" and not changed:
+                old_tree, _ = self.old_tree_and_lines(path)
+                touched = _changed_old_lines(base_src, new)
+                if data_only(old_tree, new_tree_for_stmts, base_src, new, touched):
+                    refined = self.state_refs.readers(rows)
+                elif not rows and same_runtime_declarations(base_src, new):
+                    refined = 0
+                elif not rows and not any(self.indirect_hits.get(path, {}).get(n) or self.line_hits(path).get(n)
+                                          for n in touched):
+                    if data_only(old_tree, new_tree_for_stmts, base_src, new, touched, condition=True):
+                        refined = 0
+                if refined == 0 and not rows:
+                    return
+        limit = -1 if refined is None else refined
         import_rows = self.indirect_hits.get(path)
         if import_rows and (scope_edit or changed):
             base_bytes = (self.base / path).read_bytes()
@@ -436,8 +496,8 @@ class Analyzer:
                 # below selects. Function bodies run at import time keep the importer attribution.
                 skip = self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
             for ln in _changed_old_lines(base_bytes, new):
-                if ln not in skip:
-                    out.broad |= import_rows.get(ln, 0)
+                if ln not in skip and ln not in equivalent:
+                    out.broad |= import_rows.get(ln, 0) & limit
         if not dirty:
             return
         # A heap observer is a candidate if it executes the changed code (normal coverage rule),
@@ -480,15 +540,15 @@ class Analyzer:
                     matched_all = False
                     break
             if matched_all:
-                out.broad |= cls_mask
+                out.broad |= cls_mask & limit
                 return
         dialect = Path(path).stem
-        out.broad |= runtime
+        out.broad |= runtime & limit
         if path.startswith("sqlglot/") and dialect in self.dialects:
-            out.broad |= self.dialects[dialect] | self.index["lazy_imports"].get(path, 0)
+            out.broad |= (self.dialects[dialect] | self.index["lazy_imports"].get(path, 0)) & limit
         else:
             # Module-level non-class data changes keep the conservative rule.
-            out.broad |= coverage | self.importers[path]
+            out.broad |= (coverage | self.importers[path]) & limit
 
 
 def main():
@@ -500,10 +560,17 @@ def main():
     analyzer = Analyzer(args.dataset / "tests.json")
     print(f"map_load_cpu={time.process_time()-start:.4f}", file=sys.stderr)
     answers = json.loads((args.dataset / "answers.json").read_bytes())["commits"] if args.check else {}
+    from runner import Session
+    with Session() as state_session:
+        return check_dataset(args, analyzer, answers, state_session)
+
+
+def check_dataset(args, analyzer, answers, state_session):
     hits = failures = selected = 0
     for patch in sorted((args.dataset / "commits").glob("*.patch")):
         try:
-            result = analyzer.analyze(patch.read_bytes().decode("utf-8", "surrogateescape"))
+            result = analyzer.analyze(patch.read_bytes().decode("utf-8", "surrogateescape"),
+                                      session=lambda: state_session)
             candidates = sorted(result.selected())
         except Exception as e:
             print(f"fallback {patch.stem} {e!r}", file=sys.stderr)

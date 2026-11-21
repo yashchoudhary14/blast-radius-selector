@@ -54,7 +54,7 @@ def stages(base, tests):
     yield
 
 
-def serve_stages(channels, root, base, tests, enter, run):
+def serve_stages(channels, root, base, tests, enter, operations):
     # Test children choose affinity at fork just like cold children. Pinning
     # this long-lived ancestor would put every later probe on its startup CPUs.
     enter(root, base, False, pin=False)
@@ -77,7 +77,8 @@ def serve_stages(channels, root, base, tests, enter, run):
             for other in channels[index + 1:]:
                 other.close()
             while (request := conn.recv()) is not None:
-                conn.send(run(root, base, *request, warm=True))
+                operation, args = request
+                conn.send(operations[operation](root, base, *args, warm=True))
             break
     finally:
         for conn in channels:
@@ -89,7 +90,7 @@ def serve_stages(channels, root, base, tests, enter, run):
 class WarmParents:
     live = set()
 
-    def __init__(self, root, base, tests, enter, run):
+    def __init__(self, root, base, tests, enter, operations):
         graph = Path("/app/maps/runner_importers.json")
         self.importers = json.loads(graph.read_bytes()) if graph.is_file() else {}
         pairs = [Pipe() for _ in range(4)]
@@ -98,7 +99,7 @@ class WarmParents:
             for client, _ in pairs:
                 client.close()
             try:
-                serve_stages([server for _, server in pairs], root, base, tests, enter, run)
+                serve_stages([server for _, server in pairs], root, base, tests, enter, operations)
             except (EOFError, BrokenPipeError):
                 pass
             except BaseException:

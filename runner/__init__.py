@@ -146,6 +146,43 @@ def _fork_run(root, base, ids, deadlines, early, deadline, case_filter, *, warm)
     return result
 
 
+def _state_child(fd, root, base, warm):
+    from .state import diff, ImportFailure
+    try:
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), 1)
+            os.dup2(sink.fileno(), 2)
+        _enter_tree(root, base, warm)
+        changes = diff(root)
+        result = ("ok", [(owner, key, *info) for (owner, key), info in changes.items()])
+    except ImportFailure:
+        result = ("broken", [])
+    except BaseException:
+        result = ("unknown", [])
+    with os.fdopen(fd, "wb") as output:
+        output.write(json.dumps(result).encode())
+    os._exit(0)
+
+
+def _fork_state(root, base, deadline, *, warm):
+    start = _usage()
+    data = bytearray()
+    with child_pipe(_state_child, root, base, warm) as fd:
+        while len(data) < 1048576:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+    try:
+        status, rows = json.loads(data)
+    except ValueError:
+        status, rows = "unknown", []
+    return status, rows, _usage() - start
+
+
 class Session:
     def __init__(self, base="/sqlglot", tmp="/tmp/br", *, warm_fixtures=True):
         self.base = Path(base).resolve()
@@ -165,7 +202,8 @@ class Session:
             self._clear()
             populate(self.base, self._root, {})
             try:
-                self._warm = WarmParents(self._root, self.base, self.seconds, _enter_tree, _fork_run)
+                self._warm = WarmParents(self._root, self.base, self.seconds, _enter_tree,
+                                         {"tests": _fork_run, "state": _fork_state})
             except (OSError, EOFError) as exc:
                 print(f"runner preload failed: {exc!r}", file=sys.stderr)
                 self.warm_fixtures = False
@@ -175,6 +213,22 @@ class Session:
 
     def import_stage(self, paths):
         return self._warm.stage(paths) if self._warm else -1
+
+    def import_state(self, edits, deadline):
+        """Only stage zero is production-only. Fall back to a fresh child for core edits."""
+        self._clear()
+        try:
+            populate(self.base, self._root, edits)
+            if self._warm and self._warm.stage(edits) >= 0:
+                parent = self._warm.snapshots[0][0]
+                parent.send(("state", (deadline,)))
+                status, rows, cpu = parent.recv()
+                self._warm.cpu += cpu
+            else:
+                status, rows, cpu = _fork_state(self._root, self.base, deadline, warm=False)
+            return status, rows, cpu
+        finally:
+            self._clear()
 
     def close(self):
         if self._warm:
@@ -222,7 +276,7 @@ class Session:
             request = (ids, deadlines, stop_on_first_fail, deadline, case_filter)
             if parent is not None:
                 try:
-                    parent.send(request)
+                    parent.send(("tests", request))
                     result = parent.recv()
                 except (EOFError, OSError) as exc:
                     print(f"runner snapshot unavailable: {exc!r}", file=sys.stderr)
