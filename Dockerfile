@@ -23,6 +23,20 @@ FROM source AS static
 COPY maps/ maps/
 COPY runner/ runner/
 COPY selector/ selector/
+RUN python - <<'PY'
+import json
+from pathlib import Path
+
+maps = Path("/app/maps")
+directory_reads = maps / "directory_reads.json"
+if not directory_reads.exists():
+    # Without the optional per-test listing audit, a creation or deletion
+    # can affect any test which enumerates the nearest existing directory.
+    base = Path("/sqlglot")
+    numbers = sorted(map(int, json.loads((maps / "durations.json").read_bytes())))
+    directories = [base, *(p for p in base.rglob("*") if p.is_dir())]
+    directory_reads.write_text(json.dumps({p.relative_to(base).as_posix(): numbers for p in directories}))
+PY
 RUN python -m selector.collect && python -m selector.build_maps && \
     python -m compileall -q /app && chmod -R a+rX /sqlglot /app
 ENV SELECTOR_STATIC=1
