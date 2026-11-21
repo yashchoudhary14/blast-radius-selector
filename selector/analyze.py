@@ -5,6 +5,7 @@ import ast
 import gzip
 import json
 import marshal
+import math
 import sys
 import time
 from collections import defaultdict
@@ -20,6 +21,7 @@ from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
+from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
 try:
@@ -28,6 +30,50 @@ except AttributeError:
     pass
 
 INTERPRETER_SETTINGS = {"setrecursionlimit", "set_int_max_str_digits"}
+
+
+def _outside_span(source, node):
+    lines = source.splitlines(keepends=True)
+    return (lines[:node.lineno - 1] + [lines[node.lineno - 1][:node.col_offset]],
+            [lines[node.end_lineno - 1][node.end_col_offset:]] + lines[node.end_lineno:])
+
+
+def _changed_assign(old_tree, new_tree, base_src, new_src, touched):
+    def values(tree):
+        for stmt in ast.walk(tree):
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else (stmt.target,)
+                if stmt.value and all(isinstance(t, ast.Name) for t in targets):
+                    yield targets, stmt.value
+
+    for (ot, ov), (nt, nv) in zip(values(old_tree), values(new_tree)):
+        if touched and all(ov.lineno <= n <= ov.end_lineno for n in touched):
+            if ([t.id for t in ot] == [t.id for t in nt]
+                    and _outside_span(base_src, ov) == _outside_span(new_src, nv)):
+                return [t.id for t in ot], ov, nv
+    return None, None, None
+
+
+def _is_const_bool_dict(node):
+    return (isinstance(node, ast.Dict) and all(k is not None for k in node.keys)
+            and all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in node.keys)
+            and all(isinstance(v, ast.Constant) and isinstance(v.value, bool) for v in node.values))
+
+
+def _is_docstring_only(old_tree, new_tree, base_src, new_src, touched):
+    def docs(tree):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef)) and node.body:
+                first = node.body[0]
+                if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    yield first.value
+
+    for a, b in zip(docs(old_tree), docs(new_tree)):
+        if touched and all(a.lineno <= n <= a.end_lineno for n in touched):
+            if a.value and b.value and a.value != b.value and _outside_span(base_src, a) == _outside_span(new_src, b):
+                return True
+    return False
 
 
 def _get_func_node(tree, qname):
@@ -395,6 +441,16 @@ class Analyzer:
         for t in self.tests:
             mask |= 1 << t["number"]
         return mask
+
+    @lru_cache(maxsize=1)
+    def _catalog_schedule(self):
+        millis = {row["number"]: math.floor(row["seconds"] * 1000 + 0.5) for row in self.tests}
+        _, all_cost = schedule(millis, millis)
+        return millis, all_cost
+
+    def _is_full_schedule(self, mask):
+        millis, all_cost = self._catalog_schedule()
+        return schedule(set(numbers(mask)), millis)[1] >= all_cost
 
     def _pytest_config(self, p, new):
         """Config files pytest discovers for the test tree."""
@@ -856,122 +912,200 @@ class Analyzer:
             out.query_spans = None
         if prioritize and (changed or dirty):
             out.priority |= self.changed_line_hits(path, new)
+        def compute_broad(limit_mask, *, include_probe=False):
+            broad = 0
+            import_rows = self.indirect_hits.get(path)
+            if import_rows and (scope_edit or changed):
+                base_bytes = (self.base / path).read_bytes()
+                skip = set(header_skip) if (not scope_edit and changed and all_body_only) else set()
+                usage = self.index.get("class_usage", {})
+                if (dirty and "" not in dirty and usage and path.startswith("sqlglot/expressions/")
+                        and all(f"{path}::{o}" in usage for o in dirty) and self.expr_owners(path, dirty)):
+                    # Expression class-body data (arg_types, flags) executes only while its own module is
+                    # imported; its effect reaches tests through the class, which the class-usage refinement
+                    # below selects. Function bodies run at import time keep the importer attribution.
+                    skip |= self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
+                import_clean = None
+                imp_mods = self.import_modules.get(path, {})
+                imp_hits = self.import_hits.get(path, {})
+                c_hits = self.cache_hits.get(path, {})
+                for ln in _changed_old_lines(base_bytes, new):
+                    if ln in skip or ln in equivalent:
+                        continue
+                    if (include_probe and not scope_edit and changed and all_body_only and single_edit and probe
+                            and (imp_hits.get(ln, 0) & limit_mask) and ln in imp_mods
+                            and all(m.startswith("sqlglot/") for m in imp_mods[ln])):
+                        if import_clean is None:
+                            status, rows = probe()
+                            if status == "broken":
+                                out.broken = True
+                                out.broad |= coverage | self.importers[path]
+                                return None
+                            import_clean = (status == "ok" and all((r[0], r[1]) in changed_symbols for r in rows))
+                        if import_clean:
+                            broad |= c_hits.get(ln, 0) & limit_mask
+                            continue
+                    broad |= import_rows.get(ln, 0) & limit_mask
+            if not dirty:
+                return broad
+            # A heap observer is a candidate if it executes the changed code (normal coverage rule),
+            # or the change is module-level/class-level in a module it imports, or the module is broken.
+            heap = self.index["heap_observers"] & self.importers[path]
+            if not (path.startswith(("sqlglot/dialects/", "sqlglot/generators/")) or path == "sqlglot/generator.py"):
+                # Heap observers only see allocations made while they run. Data edits elsewhere reach them
+                # only through code they execute (runtime coverage of this module). test_generator_memory
+                # builds every dialect's generator, so dialect/generator modules stay included.
+                heap &= runtime
+            broad |= heap
+            if test_file:
+                for owner in dirty:
+                    affected = self.class_tests[path + "::" + owner] if owner else 0
+                    broad |= affected or (self.file_tests[path] | coverage | self.importers[path])
+                return broad
+            class_usage = self.index.get("class_usage", {})
+            # Class-usage refinement is only trusted for Expression node classes: they are created per
+            # parse (so per-test instantiation records are reliable) and their class data (arg_types,
+            # flags) is read through instances or the generator's `<key>_sql` dispatch. Other classes
+            # (tokenizer/parser/generator/dialect cores) have cached or import-time instances whose use
+            # is invisible to per-test records (corpus c1/5xwe: TokenizerCore.__slots__), so they keep the
+            # conservative rule below.
+            # Enum/helper classes (adv k1f1: DType member value) are used by reference, not instantiation.
+            if ("" not in dirty and class_usage and path.startswith("sqlglot/expressions/")
+                    and self.expr_owners(path, dirty)):
+                matched_all = True
+                cls_mask = 0
+                for owner in dirty:
+                    key = f"{path}::{owner}"
+                    if key in class_usage:
+                        cls_mask |= class_usage[key]
+                        cls_mask |= self.index["by_name"].get(owner.split(".")[-1].lower() + "_sql", 0)
+                        # Tests that ran methods defined on this class (not the whole module: core.py
+                        # defines the Expression base used by every test).
+                        for q, mask in hits.items():
+                            if q.startswith(owner + "."):
+                                cls_mask |= mask
+                    else:
+                        matched_all = False
+                        break
+                if matched_all:
+                    broad |= cls_mask & limit_mask
+                    return broad
+            dialect = Path(path).stem
+            broad |= runtime & limit_mask
+            if path.startswith("sqlglot/") and dialect in self.dialects:
+                broad |= (self.dialects[dialect] | self.index["lazy_imports"].get(path, 0)) & limit_mask
+            else:
+                # Module-level non-class data changes keep the conservative rule.
+                broad |= (coverage | self.importers[path]) & limit_mask
+            return broad
+
+        def skip_reason():
+            # Rule 1 (empty): single-file edit with no direct/broad/coverage/importers/static-broad tests
+            # and no dict-read fallback tests (incomplete==0 and no tracked dict reads on this path).
+            # Every probe outcome ("ok" with any rows, "broken", "unknown") produces the empty set.
+            if single_edit and not out.mask and not (coverage | self.importers[path]) and compute_broad(-1) == 0:
+                if changed or not self.dict_reads or (
+                        not self.dict_reads["incomplete"]
+                        and all(not e["whole"] and not e["keys"] and not e["import_whole"] and not e["import_keys"]
+                                for (p, _, _), e in self.dict_reads["dicts"].items() if p == path)):
+                    return "empty", True
+
+            static_broad = compute_broad(-1)
+            broken_included = ((coverage | self.importers[path]) & ~(out.mask | static_broad)) == 0
+
+            # Rule 2 (changed_full): when a function also changed (changed=True), Site 1 skips
+            # "if status == 'ok' and not changed", so "ok" (any rows) and "unknown" both fall through
+            # to compute_broad(-1). When single_edit holds, coverage|importers[path] is already included,
+            # the schedule is already at full-catalog price, and entry_edits cannot witness a top-level
+            # None->bool default edit, setting broken=True matches "broken" with zero schedule penalty.
+            if changed:
+                if single_edit and broken_included and self._is_full_schedule(out.mask | static_broad):
+                    from .patch_proof import entry_edits
+                    old_tree, _ = self.old_tree_and_lines(path)
+                    if not entry_edits(old_tree, new_tree_for_stmts):
+                        return "changed_full", True
+                return None, False
+
+            old_tree, _ = self.old_tree_and_lines(path)
+            touched = _changed_old_lines(base_src, new)
+
+            # Rule 3 (docstring): single-file edit changing only a non-empty Module/ClassDef docstring
+            # literal (bytes outside the literal identical). Under "ok" (any rows) and "unknown", all
+            # post-probe refinements fail so selection falls through to compute_broad(-1). Requiring
+            # broken_included and full-catalog schedule with broken=True makes the skipped selection
+            # a strict superset even of "broken" with zero schedule penalty (and in pinned sqlglot,
+            # only Expr.__init_subclass__ touches __doc__, preserving truthiness for non-empty strings).
+            if (single_edit and broken_included and self._is_full_schedule(out.mask | static_broad)
+                    and _is_docstring_only(old_tree, new_tree_for_stmts, base_src, new, touched)):
+                return "docstring", True
+
+            # Rule 4 (arg_types): single-file edit on tracked Expression subclasses (is_expr_cls,
+            # "" not in dirty) replacing only one arg_types literal with another dict[str, bool].
+            # - "ok" (any rows): is_expr_cls bypasses _dict_value_candidates; data_only is True and
+            #   state_refs.readers(rows) returns None on lowercase arg_types/required_args (or <= -1),
+            #   falling through to compute_broad(-1) (or 0 <= compute_broad(-1) if rows=[]).
+            # - "unknown": falls through to compute_broad(-1).
+            # - "broken": impossible in pinned sqlglot because every import-time consumer of arg_types
+            #   (Expr.__init_subclass__, **Cast.arg_types, set(exp.Select.arg_types)) accepts any
+            #   dict[str, bool] without raising.
+            is_expr_cls = (
+                path.startswith("sqlglot/expressions/")
+                and "" not in dirty
+                and self.expr_owners(path, dirty)
+                and all(f"{path}::{o}" in self.index.get("class_usage", {}) for o in dirty)
+            )
+            if single_edit and is_expr_cls and data_only(old_tree, new_tree_for_stmts, base_src, new, touched):
+                targets, ov, nv = _changed_assign(old_tree, new_tree_for_stmts, base_src, new, touched)
+                if (targets == ["arg_types"]
+                        and _is_const_bool_dict(ov) and _is_const_bool_dict(nv)
+                        and list(ast.literal_eval(ov).items()) != list(ast.literal_eval(nv).items())):
+                    return "arg_types", False
+
+            return None, False
+
         refined = None
         if dirty and scope_edit and probe:
-            status, rows = probe()
-            if status == "broken":
-                out.broken = True
-                out.broad |= coverage | self.importers[path]
-                return
-            if status == "ok" and not changed:
-                old_tree, _ = self.old_tree_and_lines(path)
-                touched = _changed_old_lines(base_src, new)
-                is_expr_cls = (
-                    path.startswith("sqlglot/expressions/")
-                    and self.expr_owners(path, dirty)
-                    and all(f"{path}::{o}" in self.index.get("class_usage", {}) for o in dirty)
-                )
-                if not is_expr_cls:
-                    dict_mask = self._dict_value_candidates(path, old_tree, new, rows)
-                    if dict_mask is not None:
-                        out.broad |= dict_mask
-                        return
-                if data_only(old_tree, new_tree_for_stmts, base_src, new, touched):
-                    refined = self.state_refs.readers(rows)
-                elif not rows and same_runtime_declarations(base_src, new):
-                    refined = 0
-                elif not rows and not any(self.indirect_hits.get(path, {}).get(n) or self.line_hits(path).get(n)
-                                          for n in touched):
-                    if data_only(old_tree, new_tree_for_stmts, base_src, new, touched, condition=True):
-                        refined = 0
-                elif single_edit and self._unused_added_imports(path, old_tree, new_tree_for_stmts, rows):
+            reason, mark_broken = skip_reason()
+            if reason is not None:
+                if mark_broken:
+                    out.broken = True
+                print(f"state {path} status=skipped reason={reason}", file=sys.stderr)
+            else:
+                status, rows = probe()
+                if status == "broken":
+                    out.broken = True
+                    out.broad |= coverage | self.importers[path]
                     return
-                if refined == 0 and not rows:
-                    return
-        limit = -1 if refined is None else refined
-        import_rows = self.indirect_hits.get(path)
-        if import_rows and (scope_edit or changed):
-            base_bytes = (self.base / path).read_bytes()
-            skip = set(header_skip) if (not scope_edit and changed and all_body_only) else set()
-            usage = self.index.get("class_usage", {})
-            if (dirty and "" not in dirty and usage and path.startswith("sqlglot/expressions/")
-                    and all(f"{path}::{o}" in usage for o in dirty) and self.expr_owners(path, dirty)):
-                # Expression class-body data (arg_types, flags) executes only while its own module is
-                # imported; its effect reaches tests through the class, which the class-usage refinement
-                # below selects. Function bodies run at import time keep the importer attribution.
-                skip |= self.import_self_only.get(path, set()) - _function_lines(base_bytes, path)
-            import_clean = None
-            imp_mods = self.import_modules.get(path, {})
-            imp_hits = self.import_hits.get(path, {})
-            c_hits = self.cache_hits.get(path, {})
-            for ln in _changed_old_lines(base_bytes, new):
-                if ln in skip or ln in equivalent:
-                    continue
-                if (not scope_edit and changed and all_body_only and single_edit and probe
-                        and (imp_hits.get(ln, 0) & limit) and ln in imp_mods
-                        and all(m.startswith("sqlglot/") for m in imp_mods[ln])):
-                    if import_clean is None:
-                        status, rows = probe()
-                        if status == "broken":
-                            out.broken = True
-                            out.broad |= coverage | self.importers[path]
+                if status == "ok" and not changed:
+                    old_tree, _ = self.old_tree_and_lines(path)
+                    touched = _changed_old_lines(base_src, new)
+                    is_expr_cls = (
+                        path.startswith("sqlglot/expressions/")
+                        and self.expr_owners(path, dirty)
+                        and all(f"{path}::{o}" in self.index.get("class_usage", {}) for o in dirty)
+                    )
+                    if not is_expr_cls:
+                        dict_mask = self._dict_value_candidates(path, old_tree, new, rows)
+                        if dict_mask is not None:
+                            out.broad |= dict_mask
                             return
-                        import_clean = (status == "ok" and all((r[0], r[1]) in changed_symbols for r in rows))
-                    if import_clean:
-                        out.broad |= c_hits.get(ln, 0) & limit
-                        continue
-                out.broad |= import_rows.get(ln, 0) & limit
-        if not dirty:
+                    if data_only(old_tree, new_tree_for_stmts, base_src, new, touched):
+                        refined = self.state_refs.readers(rows)
+                    elif not rows and same_runtime_declarations(base_src, new):
+                        refined = 0
+                    elif not rows and not any(self.indirect_hits.get(path, {}).get(n) or self.line_hits(path).get(n)
+                                              for n in touched):
+                        if data_only(old_tree, new_tree_for_stmts, base_src, new, touched, condition=True):
+                            refined = 0
+                    elif single_edit and self._unused_added_imports(path, old_tree, new_tree_for_stmts, rows):
+                        return
+                    if refined == 0 and not rows:
+                        return
+        limit = -1 if refined is None else refined
+        broad = compute_broad(limit, include_probe=True)
+        if broad is None:
             return
-        # A heap observer is a candidate if it executes the changed code (normal coverage rule),
-        # or the change is module-level/class-level in a module it imports, or the module is broken.
-        heap = self.index["heap_observers"] & self.importers[path]
-        if not (path.startswith(("sqlglot/dialects/", "sqlglot/generators/")) or path == "sqlglot/generator.py"):
-            # Heap observers only see allocations made while they run. Data edits elsewhere reach them
-            # only through code they execute (runtime coverage of this module). test_generator_memory
-            # builds every dialect's generator, so dialect/generator modules stay included.
-            heap &= runtime
-        out.broad |= heap
-        if test_file:
-            for owner in dirty:
-                affected = self.class_tests[path + "::" + owner] if owner else 0
-                out.broad |= affected or (self.file_tests[path] | coverage | self.importers[path])
-            return
-        class_usage = self.index.get("class_usage", {})
-        # Class-usage refinement is only trusted for Expression node classes: they are created per
-        # parse (so per-test instantiation records are reliable) and their class data (arg_types,
-        # flags) is read through instances or the generator's `<key>_sql` dispatch. Other classes
-        # (tokenizer/parser/generator/dialect cores) have cached or import-time instances whose use
-        # is invisible to per-test records (corpus c1/5xwe: TokenizerCore.__slots__), so they keep the
-        # conservative rule below.
-        # Enum/helper classes (adv k1f1: DType member value) are used by reference, not instantiation.
-        if ("" not in dirty and class_usage and path.startswith("sqlglot/expressions/")
-                and self.expr_owners(path, dirty)):
-            matched_all = True
-            cls_mask = 0
-            for owner in dirty:
-                key = f"{path}::{owner}"
-                if key in class_usage:
-                    cls_mask |= class_usage[key]
-                    cls_mask |= self.index["by_name"].get(owner.split(".")[-1].lower() + "_sql", 0)
-                    # Tests that ran methods defined on this class (not the whole module: core.py
-                    # defines the Expression base used by every test).
-                    for q, mask in hits.items():
-                        if q.startswith(owner + "."):
-                            cls_mask |= mask
-                else:
-                    matched_all = False
-                    break
-            if matched_all:
-                out.broad |= cls_mask & limit
-                return
-        dialect = Path(path).stem
-        out.broad |= runtime & limit
-        if path.startswith("sqlglot/") and dialect in self.dialects:
-            out.broad |= (self.dialects[dialect] | self.index["lazy_imports"].get(path, 0)) & limit
-        else:
-            # Module-level non-class data changes keep the conservative rule.
-            out.broad |= (coverage | self.importers[path]) & limit
+        out.broad |= broad
 
 
 def main():
