@@ -17,6 +17,7 @@ from pathlib import Path
 from runner.overlay import changes
 
 from .collect import BASE, MAPS
+from .dialect_cases import isolated_test_methods
 from .operands import narrow
 from .query_cases import QueryCases, body_spans, frame_layout, pinned_layout
 from .scopes import scope_changed, snapshot
@@ -224,6 +225,7 @@ class Candidates:
     python_paths: list[str] = field(default_factory=list)
     dialect_subset_safe: bool = True
     query_spans: dict | None = field(default_factory=dict)
+    query_blocked: int = 0
     query_subsets: dict = field(default_factory=dict)
 
     @property
@@ -804,12 +806,23 @@ class Analyzer:
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
-            if new is None or not (path.startswith("sqlglot/") and p.suffix == ".py"
-                                   and (self.base / path).is_file()):
+            created = new is not None and not (self.base / path).is_file()
+            ordinary_test_edit = (
+                path.startswith("tests/dialects/") and p.match("test_*.py")
+                and not created and new is not None and not readers
+                and isolated_test_methods((self.base / path).read_bytes(), new)
+            )
+            if ordinary_test_edit:
+                consumers = self.file_tests[path] | self.importers[path] | self.index["all_hits"].get(path, 0)
+                out.query_blocked |= consumers
+                if consumers & self.index["heap_observers"]:
+                    out.dialect_subset_safe = False
+            elif new is None or not (path.startswith("sqlglot/") and p.suffix == ".py" and not created):
                 out.query_spans = None
+                if p.suffix == ".py" or readers & self.index["heap_observers"]:
+                    out.dialect_subset_safe = False
             out.direct |= readers
             out.priority |= readers
-            created = new is not None and not (self.base / path).is_file()
             if new is None or created:
                 out.structural = True
                 out.dialect_subset_safe = False
@@ -826,8 +839,6 @@ class Analyzer:
                 continue
             if p.suffix == ".py":
                 out.python_paths.append(path)
-                if not path.startswith("sqlglot/"):
-                    out.dialect_subset_safe = False
                 if path.startswith(("sqlglot/", "tests/")):
                     original = None if created else (self.base / path).read_bytes()
                     if interpreter_settings(original) != interpreter_settings(new):
@@ -865,8 +876,13 @@ class Analyzer:
                     # Packaging scripts and examples may be read or executed by path.
                     out.broad |= self.importers[path] | self.index["all_hits"].get(path, 0)
                     continue
-                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=(len(edits) == 1),
+                query_spans = out.query_spans
+                if ordinary_test_edit:
+                    out.query_spans = None
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=len(edits) == 1,
                             operand_safe=len(edits) == 1)
+                if ordinary_test_edit:
+                    out.query_spans = query_spans
         out.query_subsets = self.queries.subsets(out, edits)
         return out
 

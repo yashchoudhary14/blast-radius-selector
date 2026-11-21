@@ -108,7 +108,7 @@ class Execution:
 
         subset = self.dialects.subset(candidates) if self.memory is not None else None
         if subset is not None:
-            subset_cost = self.import_cpu + self.setup({self.memory}) + .12 * len(subset)
+            subset_cost = self.import_cpu + self.setup({self.memory}) + self.dialects.body_cost(subset)
         memory_passed = False
 
         def include_importers():

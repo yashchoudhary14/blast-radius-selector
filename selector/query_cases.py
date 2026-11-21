@@ -111,17 +111,20 @@ class QueryCases:
         if not spans:
             n = analyzer.num.get(MAX_NODES)
             if (n in self.maps and candidates.mask & (1 << n)
+                    and not candidates.query_blocked & (1 << n)
                     and not any(analyzer.index["reads"].get(p, 0) & (1 << n) for p in edits)
                     and dead_condition(analyzer, edits, self.maps[n][2])):
                 return {n: []}
             return {}
+        blocked = candidates.query_blocked
         for path, intervals in spans.items():
             imports = analyzer.indirect_hits.get(path, {})
-            if any(line in imports for start, end in intervals for line in range(start, end + 1)):
-                return {}
+            for start, end in intervals:
+                for line in range(start, end + 1):
+                    blocked |= imports.get(line, 0)
         subsets = {}
         for number in self.maps:
-            if not candidates.mask & (1 << number):
+            if not (candidates.mask & ~blocked) & (1 << number):
                 continue
             if any(analyzer.index["reads"].get(path, 0) & (1 << number) for path in edits):
                 continue
