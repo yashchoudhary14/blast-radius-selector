@@ -8,7 +8,7 @@ from .dialect_tables import concrete, same_directive_lines
 from .query_bindings import bindings, declaration
 from .query_cases import frame_layout
 from .scopes import snapshot
-from .source_equivalence import compile_source
+from .source_equivalence import compile_source, same_code
 
 
 def scalar_kind(node):
@@ -94,19 +94,12 @@ def dormant_bodies(analyzer, path, tree, compiled, before, after, bit):
             and analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False))
 
 
-def same_memory_workload(analyzer, edits, bit, revisions):
-    if len(edits) != 1:
-        return False
-    path, revised = next(iter(edits.items()))
+def _same_module_workload(analyzer, path, revised, bit, revisions):
     if (not revised or not path.startswith("sqlglot/") or not path.endswith(".py")
-            or path.endswith("/__init__.py") or analyzer.index["reads"].get(path, 0) & bit):
+            or path.endswith("/__init__.py")):
         return False
     file = analyzer.base / path
-    if not file.is_file() or path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777:
-        return False
     before = file.read_bytes()
-    if analyzer.location_observers(all_dynamic=True) & bit:
-        return False
     old_funcs, old_scopes = analyzer.old(path)
     revision = revisions.get(path)
     if revision is None:
@@ -119,8 +112,12 @@ def same_memory_workload(analyzer, edits, bit, revisions):
         # Constant and module binding changes would alter this snapshot.
         # Only a body untouched by setup, warmup and the allocation window
         # can be ignored here.
-        return (dormant_bodies(analyzer, path, tree, compiled, old_funcs, new_funcs, bit)
-                and same_directive_lines(before, revised))
+        if all(old_funcs[name][:3] == row[:3] for name, row in new_funcs.items()):
+            original, diagnostics = analyzer.old_compiled(path)
+            safe = not diagnostics and same_code(original, compiled)
+        else:
+            safe = dormant_bodies(analyzer, path, tree, compiled, old_funcs, new_funcs, bit)
+        return safe and same_directive_lines(before, revised)
     original, _ = analyzer.old_tree_and_lines(path)
     fields = constants(original, revised, path)
     if not fields:
@@ -136,3 +133,23 @@ def same_memory_workload(analyzer, edits, bit, revisions):
     # without a reader in one of those phases.
     return (all(not analyzer.state_refs.mask(field) & bit for field in fields | {"*", "*module"})
             and same_directive_lines(before, revised))
+
+
+def same_memory_workload(analyzer, edits, bit, revisions, isolated):
+    if analyzer.location_observers(all_dynamic=True) & bit:
+        return False
+    for path, revised in edits.items():
+        if analyzer.index["reads"].get(path, 0) & bit:
+            return False
+        file = analyzer.base / path
+        if not file.is_file() or path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777:
+            return False
+        if path in isolated:
+            if isolated[path] & bit:
+                return False
+            continue
+        if not _same_module_workload(analyzer, path, revised, bit, revisions):
+            return False
+    # An untouched body and an unread declaration cannot be the first change
+    # observed by the pinned allocation loop, including during imports.
+    return True

@@ -35,13 +35,13 @@ from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
-                                 dead_statement, docstring_edit, extracted_expression,
+                                 dead_statement, docstring_edit, extracted_expression, guarded_type_aliases,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
                                  relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
                                  text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
-from .tokenizer_tables import unchanged_limit_config, unchanged_limit_tokens
+from .tokenizer_tables import table_query_cases, unchanged_limit_config, unchanged_limit_tokens
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -844,6 +844,11 @@ class Analyzer:
             # bytecode observers can still see the dormant imports or moved lines.
             return (self.location_observers(all_dynamic=True) | self.state_refs.mask("co_consts")
                     | self.doc_observers())
+        if (scope_edits and headers and b"TYPE_CHECKING" in new
+                and guarded_type_aliases(old_tree, new_tree, before, compiled)
+                and _same_directives_text_only(old, new)):
+            return (self.annotation_observers() | self.state_refs.mask("co_consts")
+                    | (self.index["heap_observers"] & self.importers[path]))
         if scope_edits and reordered_statements(old, new, old_tree, new_tree, path) and same_directives(old, new):
             return self.location_observers(all_dynamic=True)
         doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
@@ -1136,13 +1141,17 @@ class Analyzer:
                     out.priority &= ~omit
         if not out.broken and not out.structural:
             omit = unaffected_fixture_tests(self, edits)
-            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, revisions):
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, revisions,
+                                                              out.isolated_test_paths):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
         if not out.broken and not out.structural:
+            for number, cases in table_query_cases(self, edits, isolated_tests, revisions,
+                                                    out.mask & ~out.query_blocked).items():
+                out.query_subsets.setdefault(number, cases)
             for number in numbers(unaffected_plan_tests(self, edits, revisions, out.mask)):
                 out.query_subsets[number] = []
         number = self.num.get(MAX_NODES)

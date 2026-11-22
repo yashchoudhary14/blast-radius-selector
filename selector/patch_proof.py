@@ -3,11 +3,13 @@ import ast
 import functools
 import gzip
 import json
+from bisect import bisect_left
 from pathlib import Path
 
 from runner.overlay import changes
 
 from .analyze import _header_span
+from .fixture_cases import FIXTURES, TPC_DS, TPC_H
 from .scopes import snapshot
 from .source_equivalence import _same_directives_text_only
 
@@ -64,11 +66,15 @@ def entry_edits(old, new):
             pos, param, mask = guard
             if param in args or param in [a.arg for a in fn.args.kwonlyargs]:
                 fn.body.pop(pos)
-                rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno, param, mask, "guard"))
+                rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno,
+                              param, mask, "guard", ()))
         for i in changes:
             defaults[i] = prior.args.defaults[i]
+            param = args[i-len(defaults)]
+            reads = tuple((node.lineno, node.end_lineno) for stmt in prior.body for node in ast.walk(stmt)
+                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == param)
             rules.append((name, prior.lineno, prior.body[0].lineno, prior.body[-1].end_lineno,
-                          args[i-len(defaults)], 1, "default"))
+                          param, 1, "default", reads))
     return rules if rules and same(old, new) else None
 
 
@@ -98,6 +104,7 @@ def evidence(number):
 class PatchProof:
     def __init__(self, analyzer, patch, isolated_tests=()):
         self.files = {}
+        self.fixture_companions = set()
         self.classified = {}
         self.analyzer = analyzer
         edits = changes(analyzer.base, patch)
@@ -105,10 +112,16 @@ class PatchProof:
             if path in isolated_tests:
                 continue
             base = analyzer.base / path
-            if not (path.startswith("sqlglot/") and path.endswith(".py") and new and base.is_file()):
+            if new is None or not base.is_file():
                 self.files.clear()
                 break
             if path in edits.modes and edits.modes[path] != base.stat().st_mode & 0o777:
+                self.files.clear()
+                break
+            if path.startswith(FIXTURES) and path.endswith(".sql") and path not in {TPC_DS, TPC_H}:
+                self.fixture_companions.add(path)
+                continue
+            if not (path.startswith("sqlglot/") and path.endswith(".py") and new):
                 self.files.clear()
                 break
             self.files[path] = (base.read_bytes(), new)
@@ -121,12 +134,13 @@ class PatchProof:
         return self.classified[key]
 
     def witness(self, number):
-        if not self.files:
+        bit = 1 << number
+        if not self.files or any(self.analyzer.index["reads"].get(path, 0) & bit for path in self.fixture_companions):
             return None
         loaded, calls, meta, reads, covered, comparisons = evidence(number)
         reasons = set()
         for path in self.files:
-            if path in reads or self.analyzer.index["reads"].get(path, 0) & (1 << number):
+            if path in reads or self.analyzer.index["reads"].get(path, 0) & bit:
                 return None
             if path not in loaded:
                 return None
@@ -140,7 +154,7 @@ class PatchProof:
             if any("." in row[0] for row in rules) and not _same_directives_text_only(*self.files[path]):
                 return None
             module = path[:-3].replace("/", ".").removesuffix(".__init__")
-            for name, line, body_start, end, param, mask, mode in rules:
+            for name, line, body_start, end, param, mask, mode, read_spans in rules:
                 symbol = f"{module}.{name}"
                 if symbol + ".metadata" in meta or (mode == "default" and symbol + ".signature" in meta):
                     return None
@@ -148,9 +162,19 @@ class PatchProof:
                 if entry is None and not any(body_start <= loc <= end for loc in covered.get(path, ())):
                     reasons.add("uncalled")
                     continue
-                if not entry or not entry.get(param, 0) & mask:
-                    return None
-                reasons.add(mode)
+                if entry and entry.get(param, 0) & mask:
+                    reasons.add(mode)
+                    continue
+                lines = covered.get(path, ())
+                if (mode == "default" and not any(
+                        self.analyzer.state_refs.mask(observer) & bit for observer in (
+                            "locals", "vars", "eval", "exec", "f_locals", "currentframe", "_getframe",
+                            "getouterframes", "gi_frame", "cr_frame", "ag_frame"))
+                        and not any((i := bisect_left(lines, a)) < len(lines) and lines[i] <= b
+                                    for a, b in read_spans)):
+                    reasons.add("default-unread")
+                    continue
+                return None
         return "+".join(sorted(reasons))
 
     @functools.cached_property
@@ -159,6 +183,8 @@ class PatchProof:
         # At ambiguous insertions or signature/data edits, retain the candidate.
         from difflib import SequenceMatcher
 
+        if self.fixture_companions:
+            return None, "fixture-companion"
         spans = {}
         for path, (old, new) in self.files.items():
             old_tree, before = self.analyzer.old_tree_and_lines(path)
