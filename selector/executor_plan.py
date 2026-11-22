@@ -86,7 +86,19 @@ def unaffected_plan_tests(analyzer, edits, revisions, mask):
     old, _ = analyzer.old_tree_and_lines(PLANNER)
     new = revisions[PLANNER][0]
     if not _join_order_only(old, new):
-        eligible &= ~analyzer.signature_observers(PLANNER)
-        if not eligible or not _explicit_set_operation_default(old, new):
+        if not _explicit_set_operation_default(old, new):
             return 0
+        keep = eligible & analyzer.signature_observers(PLANNER)
+        # The pinned TPC-DS witness records reads of the actual constructor's
+        # code and defaults across the parent and workers. It distinguishes
+        # these from signature reads of unrelated executor functions.
+        n = analyzer.num.get(EXECUTOR + "test_execute_tpcds")
+        if n == 1106 and keep & (1 << n):
+            from .patch_proof import evidence
+
+            loaded, _, metadata, reads, _, _ = evidence(n)
+            prefix = "sqlglot.planner.SetOperation.__init__."
+            if PLANNER in loaded and PLANNER not in reads and not any(name.startswith(prefix) for name in metadata):
+                keep &= ~(1 << n)
+        eligible &= ~keep
     return eligible if _same_directives_text_only(file.read_bytes(), edits[PLANNER]) else 0

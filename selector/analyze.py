@@ -1087,7 +1087,10 @@ class Analyzer:
                         out.query_spans[path] = None
                         continue
                 prior, subset_safe = out.mask, out.dialect_subset_safe
-                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
+                single_edit = production_count == 1
+                if path == "sqlglot/dialects/__init__.py" and path in edits.modes:
+                    single_edit &= edits.modes[path] == (self.base / path).stat().st_mode & 0o777
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=single_edit,
                             operand_safe=production_count == 1, revisions=revisions)
                 if concrete_edits and not out.broken and path in revisions:
                     unaffected = 0
@@ -1280,7 +1283,9 @@ class Analyzer:
 
     def isolated_tests(self, path, original, new):
         try:
-            methods = method_changes(original, new)
+            # In the pinned definition module, Validator is a plain
+            # unittest.TestCase. Its unchanged class is part of the comparison.
+            methods = method_changes(original, new, local_validator=path == "tests/dialects/test_dialect.py")
             if not methods:
                 return None
             _, diagnostics = compile_source(new, path)

@@ -25,10 +25,10 @@ def _test_class(node, validator):
                 and isinstance(base.value, ast.Name) and base.value.id == "unittest"))
 
 
-def method_changes(old, new):
+def method_changes(old, new, *, local_validator=False):
     """Return changed qualified names if all AST differences are plain tests."""
     def methods(tree):
-        validator = any(isinstance(node, ast.ImportFrom) and node.level == 0
+        validator = local_validator or any(isinstance(node, ast.ImportFrom) and node.level == 0
                         and node.module == "tests.dialects.test_dialect"
                         and any(alias.name == "Validator" and alias.asname is None for alias in node.names)
                         for node in tree.body)
