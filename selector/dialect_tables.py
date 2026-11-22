@@ -3,15 +3,13 @@
 import ast
 import gzip
 import json
-import tokenize
 from collections import defaultdict
 from functools import lru_cache
-from io import BytesIO
 from pathlib import Path, PurePosixPath
 
 from .config_edits import added_methods
 from .dialect_reads import SITES
-from .source_equivalence import DIRECTIVE
+from .source_equivalence import source_directives
 
 
 TABLES = {
@@ -21,14 +19,30 @@ TABLES = {
 
 
 def same_directive_lines(before, after):
-    def lines(source):
-        return [(tok.string, tok.line) for tok in tokenize.tokenize(BytesIO(source).readline)
-                if tok.type == tokenize.ENCODING or (tok.type == tokenize.COMMENT and DIRECTIVE.match(tok.string))]
+    original, updated = source_directives(before), source_directives(after)
+    return (original is not None and updated is not None
+            and tuple(row[1:] for row in original) == tuple(row[1:] for row in updated))
 
-    try:
-        return lines(before) == lines(after)
-    except (SyntaxError, UnicodeError, tokenize.TokenError):
+
+def copied_dialect_values(old, new):
+    def view(tree):
+        rows = [node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "DIALECT_MODULE_NAMES"]
+        return rows[0] if len(rows) == 1 else None
+
+    before, after = (view(tree) for tree in (old, new))
+    if before is None or after is None or ast.unparse(after.value) not in {
+        "dict(MODULE_BY_DIALECT).values()", "MODULE_BY_DIALECT.copy().values()",
+    }:
         return False
+    # The pinned package never mutates MODULE_BY_DIALECT. Consumers of the
+    # view use membership, length and iteration over the same ordered values.
+    revised = after.value
+    after.value = before.value
+    try:
+        return ast.dump(old) == ast.dump(new)
+    finally:
+        after.value = revised
 
 
 def concrete(path, family):
@@ -136,7 +150,9 @@ def lookups(table, field, allow_fromkeys):
 
 def table_changes(path, original, updated, known_expression, transform_callbacks=(), known_tokens=()):
     """Accept only changes to inert entries in existing dialect dispatch tables."""
-    fields = next((fields for family, fields in TABLES.items() if concrete(path, family)), None)
+    shared = path == "sqlglot/generator.py"
+    fields = TABLES["generators"] if shared else next(
+        (fields for family, fields in TABLES.items() if concrete(path, family)), None)
     if fields is None or not same_directive_lines(original, updated):
         return {}
     old, new = ast.parse(original), ast.parse(updated)
@@ -226,6 +242,10 @@ def table_changes(path, original, updated, known_expression, transform_callbacks
         if not isinstance(a.value, ast.Dict) or not isinstance(b.value, ast.Dict):
             return {}
         field = key[1]
+        if shared and (key[0] != "Generator" or len(a.value.keys) != len(b.value.keys)
+                       or any((x is None) != (y is None) or x is not None and ast.dump(x) != ast.dump(y)
+                              for x, y in zip(a.value.keys, b.value.keys))):
+            return {}
         prior, spreads, order = lookups(a.value, field, allow_fromkeys)
         revised, new_spreads, new_order = lookups(b.value, field, allow_fromkeys)
         if prior is None or revised is None or [kind for kind, _ in spreads] != [kind for kind, _ in new_spreads]:
@@ -252,6 +272,13 @@ def table_changes(path, original, updated, known_expression, transform_callbacks
                 return {}
             if field == "RANGE_PARSERS" and name not in known_tokens:
                 return {}
+            if shared:
+                # Preserve the dispatch shape and eager evaluation. Only an
+                # existing lambda's deferred behavior may change at this key.
+                x, y = prior.get(name, ()), revised.get(name, ())
+                if (len(x) != 1 or len(y) != 1 or not isinstance(x[0][3], ast.Lambda)
+                        or not isinstance(y[0][3], ast.Lambda) or ast.dump(x[0][3].args) != ast.dump(y[0][3].args)):
+                    return {}
             for table, callbacks in values:
                 for _, _, _, value in table.get(name, ()):
                     if not inert(value, known_expression, callbacks, factories):

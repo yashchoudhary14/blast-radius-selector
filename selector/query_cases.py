@@ -5,14 +5,13 @@ import gzip
 import json
 import marshal
 from bisect import bisect_left
-from functools import lru_cache
 from types import CodeType
 
 from runner.parser_cases import MAX_NODES
 from runner.query_cases import EXECUTOR
 
 from .generator_modifiers import RENDER_MODIFIERS, render_modifier_edit, render_modifier_read_lines
-from .query_bindings import bindings, reference_lines
+from .query_bindings import bindings, reference_lines, removed_private_functions
 
 
 TPCDS = EXECUTOR + "test_execute_tpcds"
@@ -69,11 +68,6 @@ def frame_layout(code, *, locals=True):
             tuple(frame_layout(c, locals=locals) for c in code.co_consts if isinstance(c, CodeType)))
 
 
-@lru_cache(maxsize=32)
-def pinned_layout(base, path):
-    return frame_layout(compile((base / path).read_bytes(), path, "exec", dont_inherit=True))
-
-
 def body_spans(old, new, spans):
     """Use statement precision for expression edits, widen changed control flow."""
     if not old or not new or ast.get_docstring(old, clean=False) != ast.get_docstring(new, clean=False):
@@ -116,9 +110,10 @@ class QueryCases:
         before = original.read_bytes()
         result = bindings(before, source, path)
         render_modifiers = result is None and render_modifier_edit(before, source, path)
-        if result is None and not render_modifiers:
+        removed = removed_private_functions(before, source) if result is None and not render_modifiers else set()
+        if result is None and not render_modifiers and not removed:
             return None
-        values, fresh = result if result is not None else ({RENDER_MODIFIERS}, set())
+        values, fresh = result if result is not None else ({RENDER_MODIFIERS} if render_modifiers else set(), set())
         if any(not name.startswith("_") for name in fresh):
             # A new name can also appear through a package's star re-export.
             mod = path[:-3].replace("/", ".").removesuffix(".__init__")
@@ -129,7 +124,7 @@ class QueryCases:
             # The corresponding lazy packages and serde can resolve names by string.
             observers |= analyzer.state_refs.mask("*module")
         readers = eligible & observers
-        for name in values | fresh:
+        for name in values | fresh | removed:
             for ref_path in analyzer.state_refs.refs.get(name, ()):
                 lines = (render_modifier_read_lines(analyzer, ref_path) if render_modifiers
                          else reference_lines(analyzer, ref_path, name, name in values))

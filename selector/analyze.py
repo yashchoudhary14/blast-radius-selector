@@ -24,13 +24,15 @@ from .config_edits import added_methods, configuration_changes
 from .core_headers import (inert_header, only_nested_definitions, private_constants,
                            retired_dialect_bindings, schema_methods, shared_core)
 from .dialect_cases import isolated_test_methods
-from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
+from .dialect_tables import DialectTableReads, concrete, copied_dialect_values, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
-from .fixture_cases import TPC_DS, TPC_H, fixture_case_subsets, unaffected_fixture_tests
+from .executor_plan import unaffected_plan_tests
+from .fixture_cases import PROJECTED_FIXTURES, TPC_DS, TPC_H, fixture_effects
 from .memory_edits import same_memory_workload
 from .operands import narrow
 from .parser_payload import unchanged_limit_assertions
-from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
+from .query_bindings import cached_stdlib_names
+from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
@@ -40,7 +42,7 @@ from .source_equivalence import (_same_directives_text_only, added_binding, comp
                                  text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
-from .tokenizer_tables import unchanged_limit_tokens
+from .tokenizer_tables import unchanged_limit_config, unchanged_limit_tokens
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -277,6 +279,7 @@ def numbers(mask):
         mask ^= low
 
 
+@lru_cache(maxsize=64)
 def collection_actions(source):
     """Find statements that can write shared state while a test module imports."""
     if source is None:
@@ -320,6 +323,7 @@ def removed_cells(before, after):
             and set(before.co_varnames) | old_cells == set(after.co_varnames) | new_cells)
 
 
+@lru_cache(maxsize=64)
 def interpreter_settings(source):
     """Find writes to interpreter-wide settings that survive a test's execution."""
     if not source or not any(name.encode() in source for name in INTERPRETER_SETTINGS):
@@ -527,6 +531,10 @@ class Analyzer:
     @lru_cache(maxsize=32)
     def old_code(self, path):
         return functions(self.old_compiled(path)[0])
+
+    @lru_cache(maxsize=32)
+    def old_layout(self, path, *, locals=True):
+        return frame_layout(self.old_compiled(path)[0], locals=locals)
 
     _SAFE_DYNAMIC_SITES = frozenset({
         ("sqlglot/expressions/core.py", 2491),
@@ -739,6 +747,55 @@ class Analyzer:
                         mask |= self.line_hits(path).get(line, 0) | self.indirect_hits.get(path, {}).get(line, 0)
         return mask
 
+    def cached_import_readers(self, path, names):
+        module = path[:-3].replace("/", ".")
+        exposed = {module}
+        if path.startswith("sqlglot/expressions/"):
+            # The pinned expression package reexports its submodules. Its
+            # class discovery only admits Expr subclasses. The functools
+            # callables cannot enter those registries or replace an export.
+            if any(name.lower() in self.expression_exports() for name in names):
+                return None
+            exposed.add("sqlglot.expressions")
+            functions_path = "sqlglot/expressions/functions.py"
+            tree, _ = self.old_tree_and_lines(functions_path)
+            if any(isinstance(node, ast.ImportFrom) and _resolve_import_from(functions_path, node) == module
+                   and any(alias.name == "*" for alias in node.names) for node in tree.body):
+                exposed.add("sqlglot.expressions.functions")
+        if exposed & self._test_star_imports():
+            return None
+        readers = self.location_observers(all_dynamic=True)
+        for name in names:
+            if name in self.state_refs.fields:
+                readers |= self.state_refs.mask(name)
+            for ref, lines in self.state_refs.refs.get(name, {}).items():
+                tree, _ = self.old_tree_and_lines(ref)
+                if any(node.lineno in lines and (
+                    isinstance(node, ast.Constant) and node.value == name
+                    or isinstance(node, ast.ImportFrom) and _resolve_import_from(ref, node) in exposed
+                    and any(alias.name == name for alias in node.names)
+                ) for node in ast.walk(tree) if isinstance(node, (ast.Constant, ast.ImportFrom))):
+                    readers |= self._lines_and_indirect_mask(ref, lines)
+        for ref, lines in self.state_refs.refs.get("*module", {}).items():
+            # These two lazy dispatchers resolve attributes in their own
+            # packages, so they cannot observe a binding elsewhere.
+            if (ref in {"sqlglot/dialects/__init__.py", "sqlglot/optimizer/__init__.py"}
+                    and path.rsplit("/", 1)[0] != ref.rsplit("/", 1)[0]):
+                continue
+            if ref == "sqlglot/serde.py" and self.dialect_reads.records:
+                field = "MODULE_ATTRIBUTE"
+                unobserved = self.dialect_reads.traced.get(field, 0)
+                for name in names:
+                    unobserved &= ~self.dialect_reads.observed.get((field, name), 0)
+                tree, _ = self.old_tree_and_lines(ref)
+                monitored = {node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
+                             and ast.unparse(node) == "getattr(module, class_name)"}
+                readers |= self._lines_and_indirect_mask(ref, set(lines) - monitored)
+                readers |= self._lines_and_indirect_mask(ref, monitored & set(lines)) & ~unobserved
+                continue
+            readers |= self._lines_and_indirect_mask(ref, lines)
+        return readers & self.binding_users(path)
+
     def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits, *,
                             changed_bodies=(), funcs_same=True, probe=None, out=None, coverage=0):
         old = (self.base / path).read_bytes()
@@ -747,6 +804,9 @@ class Analyzer:
         if diagnostics:
             return None
         old_tree, _ = self.old_tree_and_lines(path)
+        if (path == "sqlglot/dialects/__init__.py" and out is not None and len(out.paths) == 1 and scope_edits
+                and copied_dialect_values(old_tree, new_tree) and same_directives(old, new)):
+            return self.location_observers(all_dynamic=True) | self.index["heap_observers"]
         if insertion:
             if relocated_code(before, compiled, insertion):
                 if same_directives(old, new, insertion):
@@ -755,6 +815,16 @@ class Analyzer:
                   and same_directives(old, new, insertion)):
                 return self.location_observers(all_dynamic=True)
             if scope_edits or headers:
+                if (out is not None and len(out.paths) == 1
+                        and path not in {"sqlglot/__init__.py", "sqlglot/__main__.py"}
+                        and not path.endswith("/__init__.py") and b"from functools import " in new):
+                    names = cached_stdlib_names(old_tree, new_tree, insertion)
+                    if names and same_directives(old, new, insertion):
+                        readers = self.cached_import_readers(path, names)
+                        if readers is not None:
+                            # A source-location observer can also see the inserted import
+                            # without reading the new binding.
+                            return readers | self.location_observers()
                 binding = added_binding(old_tree, new_tree, insertion, path, before)
                 if binding is not None and same_directives(old, new, insertion):
                     name, module = binding
@@ -848,6 +918,7 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
+        revisions = {}
         out.paths = tuple(edits)
         isolated_tests = self.isolated_test_edits(edits)
         # Only verified test-method edits can accompany a single production edit.
@@ -894,15 +965,15 @@ class Analyzer:
                                   p.startswith("sqlglot/") and p.endswith(".py")
                                   and p != "sqlglot/__main__.py" and data is not None
                                   and (self.base / p).is_file()) for p, data in edits.items())) else None
-        tpc_fixtures = []
+        projected_fixtures = []
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
             created = new is not None and not (self.base / path).is_file()
-            if path in (TPC_DS, TPC_H) and not created and new is not None and readers:
+            if path in PROJECTED_FIXTURES and not created and new is not None and readers:
                 mode = (self.base / path).stat().st_mode & 0o777
                 if edits.modes.get(path, mode) == mode:
-                    tpc_fixtures.append((path, readers))
+                    projected_fixtures.append((path, readers))
                     continue
             dialect_test = path.startswith("tests/dialects/") and p.match("test_*.py")
             out.direct |= readers
@@ -921,7 +992,6 @@ class Analyzer:
                 if not dialect_test:
                     out.python_paths.append(path)
                     continue
-            created = new is not None and not (self.base / path).is_file()
             ordinary_test_edit = (
                 dialect_test and not created and new is not None and not readers
                 and isolated_test_methods((self.base / path).read_bytes(), new)
@@ -1034,23 +1104,36 @@ class Analyzer:
                         out.query_spans[path] = None
                         continue
                 prior, subset_safe = out.mask, out.dialect_subset_safe
-                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
-                            operand_safe=production_count == 1)
-                if concrete_edits and not out.broken and new is not None:
+                single_edit = production_count == 1
+                if path == "sqlglot/dialects/__init__.py" and path in edits.modes:
+                    single_edit &= edits.modes[path] == (self.base / path).stat().st_mode & 0o777
+                self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=single_edit,
+                            operand_safe=production_count == 1, revisions=revisions)
+                if concrete_edits and not out.broken and path in revisions:
                     unaffected = 0
                     inert_for_memory = False
-                    if concrete(path, "dialects"):
+                    _, _, after, scopes = revisions[path]
+                    before, old_scopes = self.old(path)
+                    # The proofs can restore declarations and added methods.
+                    # Existing function definitions must already be identical.
+                    methods_added = before.keys() < after.keys()
+                    declarations_only = ((methods_added or scopes != old_scopes)
+                                         and before.keys() <= after.keys()
+                                         and all(row[2] == after[name][2] for name, row in before.items()))
+                    if declarations_only and concrete(path, "dialects"):
                         original = (self.base / path).read_bytes()
                         strict_changed = time_changes(path, original, new)
                         if strict_changed is not None:
                             unaffected = ~time_readers(self, strict_changed)
                             inert_for_memory = True
-                    elif self.dialect_reads.records and (concrete(path, "parsers") or concrete(path, "generators")):
+                    elif declarations_only and self.dialect_reads.records and (
+                        concrete(path, "parsers") or concrete(path, "generators")
+                    ):
                         original = (self.base / path).read_bytes()
                         tables = table_changes(path, original, new, self.dialect_reads.known_expression,
                                                self.dialect_reads.transform_callbacks(), self.dialect_reads.known_tokens())
                         keep = 0
-                        if not tables:
+                        if not tables and methods_added:
                             tables, keep = self.dialect_reads.generator_methods(path, original, new)
                         unaffected = self.dialect_reads.unrelated(tables) & ~keep
                         inert_for_memory = bool(tables) and concrete(path, "parsers")
@@ -1069,31 +1152,41 @@ class Analyzer:
                     out.broad &= ~omit
                     out.priority &= ~omit
         other_mask = out.mask
-        for path, readers in tpc_fixtures:
+        for path, readers in projected_fixtures:
             out.direct |= readers
             out.priority |= readers
-            if readers & memory_bit:
+            tpc = path in (TPC_DS, TPC_H)
+            if readers & memory_bit or (not tpc and not shared_edit and readers & self.index["heap_observers"]):
                 out.dialect_subset_safe = False
             if shared_edit:
                 out.query_blocked |= readers
-            out.query_spans[path] = None
+            if tpc or not shared_edit:
+                out.query_spans[path] = None
+        fixture_subsets = {}
         if not out.broken and not out.structural:
-            omit = unaffected_fixture_tests(self, edits, other_mask=other_mask)
-            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, candidates=out):
+            omit = 0
+            if projected_fixtures:
+                omit, fixture_subsets = fixture_effects(self, edits, other_mask)
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, revisions,
+                                                              out.isolated_test_paths):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
-        if not out.broken and not out.structural and tpc_fixtures:
-            for number, indices in fixture_case_subsets(self, edits, other_mask=other_mask).items():
-                if number in self.queries.maps and out.mask & (1 << number):
-                    out.query_subsets[number] = indices
+        for number, indices in fixture_subsets.items():
+            if number in self.queries.maps and out.mask & (1 << number):
+                out.query_subsets[number] = indices
+        if not out.broken and not out.structural:
+            for number in numbers(unaffected_plan_tests(self, edits, revisions, out.mask)):
+                out.query_subsets[number] = []
         number = self.num.get(MAX_NODES)
         if (not out.broken and not out.structural and number in self.queries.maps
-                and out.mask & ~out.query_blocked & (1 << number)
-                and (unchanged_limit_assertions(self, edits, 1 << number)
-                     or unchanged_limit_tokens(self, edits, 1 << number))):
+                and out.mask & (1 << number)
+                and ((not out.query_blocked & (1 << number)
+                      and (unchanged_limit_assertions(self, edits, 1 << number)
+                           or unchanged_limit_tokens(self, edits, 1 << number)))
+                     or unchanged_limit_config(self, edits, isolated_tests, revisions, 1 << number))):
             out.query_subsets[number] = []
         if (not out.broken and production_count and
                 edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}):
@@ -1101,7 +1194,7 @@ class Analyzer:
                 number = self.num.get(test)
                 if (number in self.queries.maps and out.query_subsets.get(number) != []
                         and out.mask & ~out.query_blocked & (1 << number)
-                        and unchanged_comment_case(self, edits, out, number, stress=test == MAX_NODES)):
+                        and unchanged_comment_case(self, edits, out, number, revisions, stress=test == MAX_NODES)):
                     out.query_subsets[number] = []
         return out
 
@@ -1225,7 +1318,9 @@ class Analyzer:
 
     def isolated_tests(self, path, original, new):
         try:
-            methods = method_changes(original, new)
+            # In the pinned definition module, Validator is a plain
+            # unittest.TestCase. Its unchanged class is part of the comparison.
+            methods = method_changes(original, new, local_validator=path == "tests/dialects/test_dialect.py")
             if not methods:
                 return None
             _, diagnostics = compile_source(new, path)
@@ -1488,14 +1583,14 @@ class Analyzer:
             mask |= self.state_refs.mask(attr, tuple(sorted(keys)))
         return mask & self.binding_users(path)
 
-    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True):
+    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True,
+               revisions=None):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
                 raise SyntaxError("deleted module")
             # ast.parse alone accepts constructs such as return outside a function.
             compiled, diagnostics = compile_source(new, path)
-            tree = ast.parse(new, path)
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
@@ -1506,8 +1601,8 @@ class Analyzer:
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
             out.mark_broken("compile-warning", path)
             return
-        if single_edit and path == "tests/__init__.py" and len(tree.body) == 1:
-            doc = ast.get_docstring(tree, clean=False)
+        if single_edit and path == "tests/__init__.py" and len(new_tree_for_stmts.body) == 1:
+            doc = ast.get_docstring(new_tree_for_stmts, clean=False)
             if (doc is not None and ">>>" not in doc and not (self.base / path).read_bytes()
                     and _same_directives_text_only(b"", new)):
                 # The empty package now sets only __doc__. Keep readers of
@@ -1519,7 +1614,9 @@ class Analyzer:
                 out.query_spans[path] = None
                 return
         old_funcs, old_scopes = self.old(path)
-        new_funcs, new_scopes = snapshot(tree, new, old_funcs)
+        new_funcs, new_scopes = snapshot(new_tree_for_stmts, new, old_funcs)
+        if revisions is not None and path.startswith("sqlglot/"):
+            revisions[path] = (new_tree_for_stmts, compiled, new_funcs, new_scopes)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
         if dirty and path == "sqlglot/dialects/dialect.py":
@@ -1550,6 +1647,14 @@ class Analyzer:
                 dict_mask = self._dict_key_candidates(path, new)
             if dict_mask is not None:
                 readers = dict_mask | (self.location_observers() & self.importers[path])
+                if len(out.paths) == 1 and path == "sqlglot/generator.py" and self.dialect_reads.records:
+                    original = (self.base / path).read_bytes()
+                    tables = table_changes(path, original, new, self.dialect_reads.known_expression)
+                    if tables and self.old_layout(path) == frame_layout(compiled):
+                        # Copies of the transform table still have the same
+                        # keys. Only call sites selecting edited keys can
+                        # run the new code, and heap checks keep attribution.
+                        readers &= ~(self.dialect_reads.unrelated(tables) & ~self.index["heap_observers"])
                 out.broad |= readers
                 out.guard_query_readers(path, readers)
                 return
@@ -1685,7 +1790,7 @@ class Analyzer:
 
         @lru_cache(maxsize=1)
         def same_layout():
-            return pinned_layout(self.base, path) == frame_layout(compiled)
+            return self.old_layout(path) == frame_layout(compiled)
 
         safe_headers, query_defaults = {}, {}
         removed_keywords = {}

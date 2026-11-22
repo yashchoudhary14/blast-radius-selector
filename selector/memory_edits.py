@@ -1,9 +1,14 @@
-"""Prove that unread constants cannot change the generator allocation loop."""
+"""Prove that a patch leaves the generator allocation workload unchanged."""
 
 import ast
+from copy import copy
 
-from .dialect_tables import concrete, same_directive_lines, target
-from .query_bindings import bindings, declaration, reference_lines
+from .core_headers import inert_header
+from .dialect_tables import concrete, same_directive_lines
+from .query_bindings import bindings, declaration
+from .query_cases import frame_layout
+from .scopes import FUNCTION, snapshot
+from .source_equivalence import compile_source
 
 
 def scalar_kind(node):
@@ -15,11 +20,19 @@ def scalar_kind(node):
     return None
 
 
-def constants(old, new, path):
+def container_kind(node):
+    kind = scalar_kind(node)
+    if kind is None and isinstance(node, (ast.Tuple, ast.Set)) and all(scalar_kind(item) for item in node.elts):
+        return type(node)
+    return kind
+
+
+def constants(old, revised, path):
     """Undo value replacements and verify every other AST node is unchanged."""
-    revised = ast.parse(new, path)
+    restored = []
     fields = set()
     dialect = any(concrete(path, family) for family in ("dialects", "generators", "parsers"))
+    kind_of = container_kind if concrete(path, "parsers") else scalar_kind
     postponed = any(isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
                     and any(alias.name == "annotations" for alias in stmt.names) for stmt in old.body)
 
@@ -37,146 +50,128 @@ def constants(old, new, path):
                     or ast.dump(before.value) == ast.dump(after.value)):
                 continue
             if class_body:
-                # A class literal can be consumed by its metaclass or a derived
-                # declaration. Keep those readers even when they only run at import.
-                kind = scalar_kind(before.value)
-                if kind is None or kind is not scalar_kind(after.value):
+                # Class literals can be consumed during class construction.
+                kind = kind_of(before.value)
+                if kind is None or kind is not kind_of(after.value):
                     continue
+            restored.append((after, after.value))
             after.value = before.value
             fields.add(name)
 
-    replace(old.body, revised.body)
-    return fields if fields and ast.dump(old) == ast.dump(revised) else set()
-
-
-_PARSER_TABLES = frozenset({"FUNCTIONS", "FUNCTION_PARSERS", "PROPERTY_PARSERS", "RANGE_PARSERS"})
-
-
-def _parser_table_lines(analyzer, path):
-    if not concrete(path, "parsers"):
-        return set()
-    tree, _ = analyzer.old_tree_and_lines(path)
-    lines = set()
-    for cls in tree.body:
-        if isinstance(cls, ast.ClassDef) and not cls.decorator_list and not cls.keywords:
-            for stmt in cls.body:
-                lhs = target(stmt)
-                if isinstance(lhs, ast.Name) and lhs.id in _PARSER_TABLES:
-                    lines.update(range(stmt.lineno, (stmt.end_lineno or stmt.lineno) + 1))
-    return lines
-
-
-def _field_hits_bit(analyzer, field, bit):
-    for reader_path in analyzer.state_refs.refs.get(field, ()):
-        lines = reference_lines(analyzer, reader_path, field, preserve_binding=True)
-        if not lines:
-            continue
-        direct = analyzer.line_hits(reader_path)
-        imports = analyzer.indirect_hits.get(reader_path, {})
-        parser_lines = _parser_table_lines(analyzer, reader_path)
-        for ln in lines:
-            if direct.get(ln, 0) & bit:
-                return True
-            if ln not in parser_lines and imports.get(ln, 0) & bit:
-                return True
-    return False
-
-
-def is_safe_parser_edit(analyzer, path, revised, bit, edits):
-    if not (revised and path.startswith("sqlglot/parsers/") and path.endswith(".py")
-            and path != "sqlglot/parsers/__init__.py"):
-        return False
-    if analyzer.index["reads"].get(path, 0) & bit:
-        return False
-    file = analyzer.base / path
-    if not file.is_file():
-        return False
-    mode = file.stat().st_mode & 0o777
-    if edits.modes.get(path, mode) != mode:
-        return False
-    original = file.read_bytes()
-    if not same_directive_lines(original, revised):
-        return False
     try:
-        old_tree = ast.parse(original, path)
-        new_tree = ast.parse(revised, path)
-    except (SyntaxError, ValueError):
-        return False
-
-    old_mod_stmts = [s for s in old_tree.body if not isinstance(s, ast.ClassDef)]
-    new_mod_stmts = [s for s in new_tree.body if not isinstance(s, ast.ClassDef)]
-    if len(old_mod_stmts) != len(new_mod_stmts):
-        return False
-    for s1, s2 in zip(old_mod_stmts, new_mod_stmts):
-        if ast.dump(s1) != ast.dump(s2):
-            return False
-
-    old_classes = [s for s in old_tree.body if isinstance(s, ast.ClassDef)]
-    new_classes = [s for s in new_tree.body if isinstance(s, ast.ClassDef)]
-    if len(old_classes) != len(new_classes):
-        return False
-    for c1, c2 in zip(old_classes, new_classes):
-        if c1.name != c2.name or c1.decorator_list or c2.decorator_list or c1.keywords or c2.keywords:
-            return False
-        if [ast.dump(b) for b in c1.bases] != [ast.dump(b) for b in c2.bases]:
-            return False
-        c1_non_fn = [s for s in c1.body if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        c2_non_fn = [s for s in c2.body if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        if len(c1_non_fn) != len(c2_non_fn):
-            return False
-        for s1, s2 in zip(c1_non_fn, c2_non_fn):
-            if ast.dump(s1) != ast.dump(s2):
-                return False
-        for s in c2.body:
-            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if s.decorator_list:
-                    return False
-    return True
+        replace(old.body, revised.body)
+        return fields if fields and ast.dump(old) == ast.dump(revised) else set()
+    finally:
+        for stmt, value in restored:
+            stmt.value = value
 
 
-def safe_memory_parsers(analyzer, edits, isolated_test_paths, bit):
-    for path, revised in edits.items():
-        if path in isolated_test_paths:
-            if isolated_test_paths[path] & bit:
+def parser_methods_only(old, new):
+    """Recognize edits confined to ordinary methods of unchanged parser classes."""
+    # The caller has already compared the ordered scope snapshots.
+    for before, after in zip(old.body, new.body):
+        if not isinstance(before, ast.ClassDef):
+            if ast.dump(before) != ast.dump(after):
                 return False
             continue
-        if not is_safe_parser_edit(analyzer, path, revised, bit, edits):
+        if before.decorator_list or before.keywords:
+            return False
+        if any(stmt.decorator_list for stmt in after.body if isinstance(stmt, FUNCTION)):
             return False
     return True
 
 
-def same_memory_workload(analyzer, edits, bit, candidates=None):
-    if (not analyzer.location_observers(all_dynamic=True) & bit
-            and not analyzer.state_refs.mask("*") & bit
-            and not analyzer.state_refs.mask("*module") & bit):
-        if candidates is not None and safe_memory_parsers(analyzer, edits, candidates.isolated_test_paths, bit):
-            return True
-    if len(edits) != 1:
+def dormant_bodies(analyzer, path, old, tree, compiled, before, after, bit):
+    from .analyze import _get_func_node
+
+    changed = [name for name, row in before.items() if row[:3] != after[name][:3]]
+    if not changed:
         return False
-    path, revised = next(iter(edits.items()))
-    if (not revised or not path.startswith("sqlglot/") or not path.endswith(".py")
+    old_code, diagnostics = analyzer.old_compiled(path)
+    if diagnostics:
+        return False
+    for name in changed:
+        fn = _get_func_node(old, name)
+        updated = _get_func_node(tree, name)
+        if (fn is None or updated is None or fn.decorator_list or getattr(fn, "type_params", ())
+                or ast.get_docstring(fn, clean=False) != ast.get_docstring(updated, clean=False)
+                or analyzer._lines_and_indirect_mask(path, range(fn.body[0].lineno, fn.end_lineno + 1)) & bit):
+            return False
+        if before[name][1] != after[name][1]:
+            if ((analyzer.signature_observers(path) | analyzer.state_refs.mask("signature")) & bit
+                    or inert_header(fn, updated, old_code.co_flags, compiled.co_flags) != "default"):
+                return False
+            # Restoring literal defaults must account for the entire header.
+            old_header, new_header = copy(fn), copy(updated)
+            old_header.body = new_header.body = []
+            new_header.args = copy(updated.args)
+            new_header.args.defaults = fn.args.defaults
+            new_header.args.kw_defaults = fn.args.kw_defaults
+            if ast.dump(old_header) != ast.dump(new_header):
+                return False
+    return analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False)
+
+
+def unchanged_module_workload(analyzer, edits, path, source, bit, revision, *, parser_only):
+    if (not source or not path.startswith("sqlglot/") or not path.endswith(".py")
             or path.endswith("/__init__.py") or analyzer.index["reads"].get(path, 0) & bit):
         return False
     file = analyzer.base / path
-    if not file.is_file() or path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777:
+    if not file.is_file() or (path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777):
         return False
-    original, _ = analyzer.old_tree_and_lines(path)
-    fields = constants(original, revised, path)
-    before = file.read_bytes()
-    if not same_directive_lines(before, revised):
+    original = file.read_bytes()
+    if not same_directive_lines(original, source):
         return False
+
+    old_funcs, old_scopes = analyzer.old(path)
+    if revision is None:
+        tree = ast.parse(source, path)
+        compiled, diagnostics = compile_source(source, path)
+        if diagnostics:
+            return False
+        new_funcs, new_scopes = snapshot(tree, source)
+    else:
+        tree, compiled, new_funcs, new_scopes = revision
+    old, _ = analyzer.old_tree_and_lines(path)
+    if old_scopes == new_scopes and old_funcs.keys() == new_funcs.keys():
+        if parser_only and not parser_methods_only(old, tree):
+            return False
+        if parser_only and all(old_funcs[name][:3] == new_funcs[name][:3] for name in old_funcs):
+            # An unchanged parser can accompany a proved dormant method edit.
+            _, diagnostics = analyzer.old_compiled(path)
+            return not diagnostics and analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False)
+        return dormant_bodies(analyzer, path, old, tree, compiled, old_funcs, new_funcs, bit)
+    if parser_only:
+        return False
+
+    fields = constants(old, tree, path)
     if not fields:
-        binding_change = bindings(before, revised, path)
+        binding_change = bindings(original, source, path)
         if binding_change is None:
             return False
         values, added = binding_change
         if values or not added or any(not name.startswith("_") for name in added):
             return False
         fields = added
-    # These assignments execute once, before the allocation loop. Their
-    # values cannot change class construction, warmup or the measured loop
-    # without a reader in one of those phases.
-    return (not analyzer.location_observers(all_dynamic=True) & bit
-            and not analyzer.state_refs.mask("*") & bit
-            and not analyzer.state_refs.mask("*module") & bit
-            and all(not _field_hits_bit(analyzer, field, bit) for field in fields))
+    # Include import-time references. A copied value can be consumed before
+    # warmup even when no reader executes during the measurement itself.
+    return all(not analyzer.state_refs.mask(field) & bit for field in fields)
+
+
+def same_memory_workload(analyzer, edits, bit, revisions, isolated_test_paths):
+    if len(edits) == 1:
+        path, source = next(iter(edits.items()))
+        if path in isolated_test_paths or not path.startswith("sqlglot/"):
+            return False
+    elif not edits or any(path not in isolated_test_paths and not concrete(path, "parsers") for path in edits):
+        return False
+    if (analyzer.location_observers(all_dynamic=True) | analyzer.state_refs.mask("*module")) & bit:
+        return False
+    for path, source in edits.items():
+        if path in isolated_test_paths:
+            if isolated_test_paths[path] & bit:
+                return False
+        elif not unchanged_module_workload(analyzer, edits, path, source, bit, revisions.get(path),
+                                          parser_only=len(edits) > 1):
+            return False
+    return True

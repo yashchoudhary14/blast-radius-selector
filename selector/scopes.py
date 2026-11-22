@@ -18,10 +18,10 @@ def structural(node):
 def snapshot(tree, source, cached=None):
     """Structurally hash function headers and bodies using AST comparison."""
     functions, scopes = {}, {}
+    saved = []
 
     def visit_nested_funcs(func_node, prefix):
         counts = Counter()
-        saved = []
         for child in ast.walk(func_node):
             if child is not func_node and isinstance(child, FUNCTION):
                 name = prefix + child.name
@@ -36,7 +36,6 @@ def snapshot(tree, source, cached=None):
                 child.body = [ast.Pass()]
                 saved.append((child, saved_body))
                 functions[name] = body, header, body, start, child.end_lineno
-        return saved
 
     def visit(node, prefix):
         counts = Counter()
@@ -57,13 +56,19 @@ def snapshot(tree, source, cached=None):
             visit_nested_funcs(stmt, name + ".")
             start = min([stmt.lineno, *(d.lineno for d in stmt.decorator_list)])
             body = structural(stmt)
+            saved.append((stmt, stmt.body))
             stmt.body = []
             header = structural(stmt)
             functions[name] = body, header, body, start, stmt.end_lineno
+        saved.append((node, node.body))
         node.body = []
         scopes[prefix.rstrip(".")] = structural(node), tuple(data), tuple(order)
 
-    visit(tree, "")
+    try:
+        visit(tree, "")
+    finally:
+        for node, body in reversed(saved):
+            node.body = body
     return functions, scopes
 
 

@@ -65,6 +65,37 @@ def preamble(tree):
     return tree.body[start:end]
 
 
+def cached_stdlib_names(old, new, insertion):
+    """Recognize fresh functools bindings inserted into the pinned preamble."""
+    first, count = insertion
+    imports = [node for node in preamble(new)
+               if first <= node.lineno <= node.end_lineno < first + count
+               and isinstance(node, ast.ImportFrom) and not node.level and node.module == "functools"]
+    if not imports:
+        return set()
+    names = []
+    for node in imports:
+        for alias in node.names:
+            value = vars(functools).get(alias.name)
+            name = alias.asname or alias.name
+            if (alias.name.startswith("_") or name.startswith("__") or value is None
+                    or not callable(value)):
+                return set()
+            names.append(name)
+    if len(set(names)) != len(names):
+        return set()
+    names = set(names)
+    for node in ast.walk(old):
+        if isinstance(node, ast.alias) and node.name == "*":
+            # The caller separately checks the pinned expression star imports.
+            continue
+        if (any(_binds(node, name) for name in names)
+                or isinstance(node, ast.Name) and node.id in names | {"__all__"}):
+            return set()
+    remaining = ast.Module(body=[node for node in new.body if node not in imports], type_ignores=new.type_ignores)
+    return names if ast.dump(old) == ast.dump(remaining) else set()
+
+
 def new_private_functions(old, new, postponed):
     old_names = {node.name for node in old.body if isinstance(node, ast.FunctionDef)}
     functions = [node for node in new.body
@@ -76,6 +107,20 @@ def new_private_functions(old, new, postponed):
                      arg.annotation for arg in ast.walk(node.args) if isinstance(arg, ast.arg))))]
     names = {node.name for node in functions}
     return functions if len(functions) == len(names) else []
+
+
+def removed_private_functions(before, after):
+    """Return removed bindings whose definition does not execute user code."""
+    old, new = ast.parse(before), ast.parse(after)
+    postponed = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                    and any(alias.name == "annotations" for alias in node.names) for node in old.body)
+    gone = new_private_functions(new, old, postponed)
+    if not gone or any(isinstance(node, ast.Name) and node.id == "__all__" for node in ast.walk(old)):
+        return set()
+    old.body = [node for node in old.body if node not in gone]
+    if ast.dump(old) == ast.dump(new) and _same_directives_text_only(before, after):
+        return {fn.name for fn in gone}
+    return set()
 
 
 def import_order(statements):
