@@ -4,6 +4,8 @@ import ast
 
 from .dialect_tables import concrete, same_directive_lines
 from .query_bindings import bindings, declaration
+from .query_cases import frame_layout
+from .scopes import snapshot
 
 
 def scalar_kind(node):
@@ -13,6 +15,13 @@ def scalar_kind(node):
             and isinstance(node.operand, ast.Constant) and type(node.operand.value) is int):
         return int
     return None
+
+
+def container_kind(node):
+    kind = scalar_kind(node)
+    if kind is None and isinstance(node, (ast.Tuple, ast.Set)) and all(scalar_kind(item) for item in node.elts):
+        return type(node)
+    return kind
 
 
 def constants(old, new, path):
@@ -39,14 +48,39 @@ def constants(old, new, path):
             if class_body:
                 # A class literal can be consumed by its metaclass or a derived
                 # declaration. Keep those readers even when they only run at import.
-                kind = scalar_kind(before.value)
-                if kind is None or kind is not scalar_kind(after.value):
+                kind_of = container_kind if concrete(path, "parsers") else scalar_kind
+                kind = kind_of(before.value)
+                if kind is None or kind is not kind_of(after.value):
                     continue
             after.value = before.value
             fields.add(name)
 
     replace(old.body, revised.body)
     return fields if fields and ast.dump(old) == ast.dump(revised) else set()
+
+
+def dormant_bodies(analyzer, path, revised, bit):
+    from .analyze import _get_func_node
+
+    before, scopes = analyzer.old(path)
+    tree = ast.parse(revised, path)
+    after, updated_scopes = snapshot(ast.parse(revised, path), revised)
+    if scopes != updated_scopes or before.keys() != after.keys():
+        return False
+    changed = [name for name, row in before.items() if row[:3] != after[name][:3]]
+    if not changed or any(before[name][1] != after[name][1] for name in changed):
+        return False
+    old_tree, _ = analyzer.old_tree_and_lines(path)
+    for name in changed:
+        fn = _get_func_node(old_tree, name)
+        updated = _get_func_node(tree, name)
+        if (fn is None or updated is None or fn.decorator_list or getattr(fn, "type_params", ())
+                or ast.get_docstring(fn, clean=False) != ast.get_docstring(updated, clean=False)
+                or analyzer._lines_and_indirect_mask(path, range(fn.body[0].lineno, fn.end_lineno + 1)) & bit):
+            return False
+    old_code, diagnostics = analyzer.old_compiled(path)
+    return (not diagnostics and frame_layout(old_code, locals=False)
+            == frame_layout(compile(revised, path, "exec", dont_inherit=True), locals=False))
 
 
 def same_memory_workload(analyzer, edits, bit):
@@ -59,15 +93,18 @@ def same_memory_workload(analyzer, edits, bit):
     file = analyzer.base / path
     if not file.is_file() or path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777:
         return False
+    before = file.read_bytes()
+    if not same_directive_lines(before, revised) or analyzer.location_observers(all_dynamic=True) & bit:
+        return False
     original, _ = analyzer.old_tree_and_lines(path)
     fields = constants(original, revised, path)
-    before = file.read_bytes()
-    if not same_directive_lines(before, revised):
-        return False
     if not fields:
         binding_change = bindings(before, revised, path)
         if binding_change is None:
-            return False
+            # Definitions and registration happen before tracing allocations.
+            # A body untouched by setup, warmup and the measurement cannot
+            # change the allocations observed by the intact memory loop.
+            return dormant_bodies(analyzer, path, revised, bit)
         values, added = binding_change
         if values or not added or any(not name.startswith("_") for name in added):
             return False
@@ -75,5 +112,4 @@ def same_memory_workload(analyzer, edits, bit):
     # These assignments execute once, before the allocation loop. Their
     # values cannot change class construction, warmup or the measured loop
     # without a reader in one of those phases.
-    return (not analyzer.location_observers(all_dynamic=True) & bit
-            and all(not analyzer.state_refs.mask(field) & bit for field in fields | {"*", "*module"}))
+    return all(not analyzer.state_refs.mask(field) & bit for field in fields | {"*", "*module"})

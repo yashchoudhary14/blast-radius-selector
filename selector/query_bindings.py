@@ -74,6 +74,20 @@ def new_private_functions(old, new, postponed):
     return functions if len(functions) == len(names) else []
 
 
+def removed_private_functions(before, after):
+    """Return removed bindings whose definition does not execute user code."""
+    old, new = ast.parse(before), ast.parse(after)
+    postponed = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                    and any(alias.name == "annotations" for alias in node.names) for node in old.body)
+    gone = new_private_functions(new, old, postponed)
+    if not gone or any(isinstance(node, ast.Name) and node.id == "__all__" for node in ast.walk(old)):
+        return set()
+    old.body = [node for node in old.body if node not in gone]
+    if ast.dump(old) == ast.dump(new) and _same_directives_text_only(before, after):
+        return {fn.name for fn in gone}
+    return set()
+
+
 def import_order(statements):
     """Preserve each uncached import's position relative to cached bindings."""
     sections = []

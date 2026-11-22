@@ -2,6 +2,8 @@
 
 from runner.query_cases import EXECUTOR, OPTIMIZER
 
+from .source_equivalence import compile_source, line_insertion, relocated_code, same_code, same_directives
+
 
 FIXTURES = "tests/fixtures/optimizer/"
 TPC_H = FIXTURES + "tpc-h/tpc-h.sql"
@@ -39,10 +41,12 @@ def executor_inputs(rows):
 
 
 def unaffected_fixture_tests(analyzer, edits):
-    if len(edits) != 1:
+    fixtures = edits.keys() & (OPTIMIZER_READERS.keys() | {TPC_H})
+    if len(fixtures) != 1:
         return 0
-    path, source = next(iter(edits.items()))
-    if source is None or (path not in OPTIMIZER_READERS and path != TPC_H):
+    path = next(iter(fixtures))
+    source = edits[path]
+    if source is None:
         return 0
     file = analyzer.base / path
     if not file.is_file():
@@ -69,4 +73,33 @@ def unaffected_fixture_tests(analyzer, edits):
             safe.add(EXECUTOR + "test_optimized_tpch")
     if path in OPTIMIZER_READERS and before == after:
         safe.add(OPTIMIZER + OPTIMIZER_READERS[path])
-    return sum(1 << analyzer.num[node] for node in safe if node in analyzer.num)
+    unaffected = sum(1 << analyzer.num[node] for node in safe if node in analyzer.num)
+    for other in edits.keys() - {path}:
+        # A companion must leave the fixture reader's code and inputs intact.
+        unaffected &= ~analyzer.index["reads"].get(other, 0)
+        if not unaffected or not companion_equivalent(analyzer, edits, other):
+            return 0
+        if other.endswith(".py"):
+            unaffected &= ~analyzer.location_observers(all_dynamic=True)
+    return unaffected
+
+
+def companion_equivalent(analyzer, edits, path):
+    file = analyzer.base / path
+    source = edits[path]
+    if source is None or not file.is_file() or edits.modes.get(path, file.stat().st_mode & 0o777) != file.stat().st_mode & 0o777:
+        return False
+    if path.startswith(FIXTURES) and path.endswith(".sql"):
+        # Each benchmark reads an explicit fixture. Independent data readers
+        # of this companion stay selected through the read mask above.
+        return True
+    if not path.startswith("sqlglot/") or not path.endswith(".py"):
+        return False
+    before = file.read_bytes()
+    original, diagnostics = analyzer.old_compiled(path)
+    revised, new_diagnostics = compile_source(source, path)
+    if diagnostics or new_diagnostics:
+        return False
+    insertion = line_insertion(before, source)
+    return ((same_code(original, revised) or (insertion and relocated_code(original, revised, insertion)))
+            and same_directives(before, source, insertion))

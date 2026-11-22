@@ -122,6 +122,21 @@ def normalize_trie_terminal(tree):
     return False
 
 
+def normalize_default_dialect(tree):
+    # The only use of this parameter is Dialect.get_or_raise(dialect), whose
+    # first branch returns the default Dialect for either falsy singleton.
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name != "Tokenizer":
+            continue
+        for fn in cls.body:
+            if (isinstance(fn, ast.FunctionDef) and fn.name == "__init__"
+                    and len(fn.args.defaults) == 1 and isinstance(fn.args.defaults[0], ast.Constant)
+                    and fn.args.defaults[0].value is False):
+                fn.args.defaults[0] = ast.Constant(value=None)
+                return True
+    return False
+
+
 def unchanged_limit_tokens(analyzer, edits, bit):
     if len(edits) != 1:
         return False
@@ -137,6 +152,12 @@ def unchanged_limit_tokens(analyzer, edits, bit):
     old, _ = analyzer.old_tree_and_lines(path)
     new = ast.parse(source)
     if path == TOKENS:
+        if (not analyzer.signature_observers(path) & bit
+                and not any(analyzer.state_refs.mask(name) & bit for name in ("__defaults__", "__kwdefaults__"))
+                and normalize_default_dialect(new)):
+            if ast.dump(old) == ast.dump(new):
+                return same_directive_lines(file.read_bytes(), source)
+            new = ast.parse(source)
         changed = normalize_tables(old, new, analyzer.dialect_reads.known_tokens())
     elif path == TOKENIZER_CORE:
         changed = normalize_tokenizer_comparisons(new)
