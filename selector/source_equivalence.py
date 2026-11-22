@@ -349,6 +349,29 @@ def docstring_only(old_source, source, old_tree, tree, before, after):
     return bool(result and result[2] and not result[3])
 
 
+def redundant_abc_metaclass(old, new):
+    originals = {node.name: node for node in old.body if isinstance(node, ast.ClassDef)}
+    for cls in new.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name not in originals:
+            continue
+        prior = originals[cls.name]
+        if (len(prior.bases) != 1 or ast.unparse(prior.bases[0]) != "abc.ABC"
+                or prior.keywords or len(cls.keywords) != 1):
+            continue
+        keyword = cls.keywords[0]
+        if keyword.arg != "metaclass" or ast.unparse(keyword.value) != "abc.ABCMeta":
+            continue
+        # __build_class__ already resolves this metaclass from the sole base.
+        # The explicit keyword is consumed before the same ABCMeta call.
+        keywords, cls.keywords = cls.keywords, []
+        try:
+            if ast.dump(old) == ast.dump(new):
+                return True
+        finally:
+            cls.keywords = keywords
+    return False
+
+
 def _get_func_ast(tree, name):
     node = tree
     for part in name.split(".")[:-1]:
@@ -891,6 +914,60 @@ def type_checking_imports(old, new):
     finally:
         for node, updated, _ in restored:
             node.body = updated
+
+
+def guarded_type_aliases(old, new, before, after):
+    """Recognize postponed annotation edits and a new, inactive type-alias block."""
+    from .core_headers import inert_header
+
+    possible = (ast.Name, ast.Attribute, ast.Subscript, ast.Tuple, ast.List, ast.BinOp,
+                ast.BitOr, ast.Constant, ast.Load)
+    original_guards = {ast.dump(node) for node in old.body if isinstance(node, ast.If)}
+    aliases = {}
+    kept, found = [], False
+    for stmt in new.body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if alias.name == "typing":
+                    aliases[alias.asname or alias.name] = alias
+        test = stmt.test if isinstance(stmt, ast.If) else None
+        if not (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                and isinstance(test.value, ast.Name) and test.value.id in aliases
+                and ast.dump(stmt) not in original_guards):
+            kept.append(stmt)
+            continue
+        name = test.value.id
+        if (found or stmt.orelse or any(
+                not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                     and isinstance(node.targets[0], ast.Name) and not node.targets[0].id.startswith("__")
+                     and node.targets[0].id != name
+                     and all(isinstance(child, possible) for child in ast.walk(node.value)))
+                for node in stmt.body)):
+            return False
+        if any((node is not aliases[name] and _binds(node, name))
+               or isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name == name
+               or isinstance(node, ast.MatchMapping) and node.rest == name
+               or isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING"
+                  and not isinstance(node.ctx, ast.Load)
+               for node in ast.walk(new)):
+            return False
+        found = True
+    if not found or len(old.body) != len(kept):
+        return False
+    for a, b in zip(old.body, kept):
+        if ast.dump(a) == ast.dump(b):
+            continue
+        if (not isinstance(a, ast.FunctionDef) or not isinstance(b, ast.FunctionDef)
+                or inert_header(a, b, before.co_flags, after.co_flags) != "annotation"):
+            return False
+        args, returns = b.args, b.returns
+        b.args, b.returns = a.args, a.returns
+        try:
+            if ast.dump(a) != ast.dump(b):
+                return False
+        finally:
+            b.args, b.returns = args, returns
+    return True
 
 
 def added_binding(old, new, insertion, path, compiled):

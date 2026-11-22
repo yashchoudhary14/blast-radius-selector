@@ -36,13 +36,14 @@ from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
-                                 dead_statement, docstring_edit, extracted_expression,
+                                 dead_statement, docstring_edit, extracted_expression, guarded_type_aliases,
                                  line_insertion, local_rename_only, optional_keyword_only, postponed_annotation,
-                                 relocated_code, reordered_statements, same_code, same_directives, signature_metadata,
+                                 redundant_abc_metaclass, relocated_code, reordered_statements, same_code,
+                                 same_directives, signature_metadata,
                                  text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
-from .tokenizer_tables import unchanged_limit_config, unchanged_limit_tokens
+from .tokenizer_tables import table_query_cases, unchanged_limit_config, unchanged_limit_tokens
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -52,6 +53,10 @@ except AttributeError:
     pass
 
 INTERPRETER_SETTINGS = {"setrecursionlimit", "set_int_max_str_digits"}
+STDLIB_METACLASS_DOCS = {
+    "sqlglot/schema.py": {"Schema", "MappingSchema"},
+    "sqlglot/helper.py": {"AutoName"},
+}
 
 
 def _outside_span(source, node):
@@ -847,7 +852,16 @@ class Analyzer:
             # bytecode observers can still see the dormant imports or moved lines.
             return (self.location_observers(all_dynamic=True) | self.state_refs.mask("co_consts")
                     | self.doc_observers())
+        if (scope_edits and headers and b"TYPE_CHECKING" in new
+                and guarded_type_aliases(old_tree, new_tree, before, compiled)
+                and _same_directives_text_only(old, new)):
+            return (self.annotation_observers() | self.state_refs.mask("co_consts")
+                    | (self.index["heap_observers"] & self.importers[path]))
         if scope_edits and reordered_statements(old, new, old_tree, new_tree, path) and same_directives(old, new):
+            return self.location_observers(all_dynamic=True)
+        if (scope_edits and path == "sqlglot/schema.py" and b"ABCMeta" in new
+                and redundant_abc_metaclass(old_tree, new_tree)
+                and _same_directives_text_only(old, new)):
             return self.location_observers(all_dynamic=True)
         doc_res = docstring_edit(old, new, old_tree, new_tree, before, compiled)
         if doc_res is not None:
@@ -856,6 +870,10 @@ class Analyzer:
             if is_plain:
                 return self.doc_observers() | loc
             if kind == "class" and path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
+                return self.doc_observers() | loc
+            if kind == "class" and owner in STDLIB_METACLASS_DOCS.get(path, ()):
+                # The pinned ABCMeta and EnumType classes have no custom
+                # creation hook that reads their nonempty docstring.
                 return self.doc_observers() | loc
             if kind == "class" and probe is not None:
                 status, rows = probe()
@@ -1166,9 +1184,9 @@ class Analyzer:
         if not out.broken and not out.structural:
             omit = 0
             if projected_fixtures:
-                omit, fixture_subsets = fixture_effects(self, edits, other_mask)
+                omit, fixture_subsets = fixture_effects(self, edits, other_mask, revisions)
             if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, revisions,
-                                                              out.isolated_test_paths):
+                                                               out.isolated_test_paths):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
@@ -1178,6 +1196,9 @@ class Analyzer:
             if number in self.queries.maps and out.mask & (1 << number):
                 out.query_subsets[number] = indices
         if not out.broken and not out.structural:
+            for number, cases in table_query_cases(self, edits, isolated_tests, revisions,
+                                                    out.mask & ~out.query_blocked).items():
+                out.query_subsets.setdefault(number, cases)
             for number in numbers(unaffected_plan_tests(self, edits, revisions, out.mask)):
                 out.query_subsets[number] = []
         number = self.num.get(MAX_NODES)
@@ -1699,7 +1720,8 @@ class Analyzer:
             )
         configuration = set()
         if dirty and dialect_code:
-            configuration = configuration_changes(path, (self.base / path).read_bytes(), new)
+            old_tree, _ = self.old_tree_and_lines(path)
+            configuration = configuration_changes(path, old_tree, new_tree_for_stmts, old_funcs, new_funcs)
             if configuration:
                 dirty.clear()
                 out.broad |= self.location_observers() & self.importers[path]

@@ -8,7 +8,7 @@ from .dialect_tables import concrete, same_directive_lines
 from .query_bindings import bindings, declaration
 from .query_cases import frame_layout
 from .scopes import FUNCTION, snapshot
-from .source_equivalence import compile_source
+from .source_equivalence import compile_source, same_code
 
 
 def scalar_kind(node):
@@ -112,14 +112,10 @@ def dormant_bodies(analyzer, path, old, tree, compiled, before, after, bit):
     return analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False)
 
 
-def unchanged_module_workload(analyzer, edits, path, source, bit, revision, *, parser_only):
-    if (not source or not path.startswith("sqlglot/") or not path.endswith(".py")
-            or path.endswith("/__init__.py") or analyzer.index["reads"].get(path, 0) & bit):
+def unchanged_module_workload(analyzer, path, source, bit, revision, *, parser_only):
+    if not source or not path.startswith("sqlglot/") or not path.endswith(".py") or path.endswith("/__init__.py"):
         return False
-    file = analyzer.base / path
-    if not file.is_file() or (path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777):
-        return False
-    original = file.read_bytes()
+    original = (analyzer.base / path).read_bytes()
     if not same_directive_lines(original, source):
         return False
 
@@ -136,10 +132,11 @@ def unchanged_module_workload(analyzer, edits, path, source, bit, revision, *, p
     if old_scopes == new_scopes and old_funcs.keys() == new_funcs.keys():
         if parser_only and not parser_methods_only(old, tree):
             return False
-        if parser_only and all(old_funcs[name][:3] == new_funcs[name][:3] for name in old_funcs):
-            # An unchanged parser can accompany a proved dormant method edit.
-            _, diagnostics = analyzer.old_compiled(path)
-            return not diagnostics and analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False)
+        if all(row[:3] == new_funcs[name][:3] for name, row in old_funcs.items()):
+            before, diagnostics = analyzer.old_compiled(path)
+            # Exact code equality also preserves the frame layout of an
+            # unchanged parser accompanying a proved dormant method edit.
+            return not diagnostics and same_code(before, compiled)
         return dormant_bodies(analyzer, path, old, tree, compiled, old_funcs, new_funcs, bit)
     if parser_only:
         return False
@@ -155,12 +152,13 @@ def unchanged_module_workload(analyzer, edits, path, source, bit, revision, *, p
         fields = added
     # Include import-time references. A copied value can be consumed before
     # warmup even when no reader executes during the measurement itself.
-    return all(not analyzer.state_refs.mask(field) & bit for field in fields)
+    return all(not analyzer.state_refs.mask(field) & bit for field in fields | {"*"})
 
 
 def same_memory_workload(analyzer, edits, bit, revisions, isolated_test_paths):
+    parser_only = len(edits) > 1
     if len(edits) == 1:
-        path, source = next(iter(edits.items()))
+        path = next(iter(edits))
         if path in isolated_test_paths or not path.startswith("sqlglot/"):
             return False
     elif not edits or any(path not in isolated_test_paths and not concrete(path, "parsers") for path in edits):
@@ -168,10 +166,15 @@ def same_memory_workload(analyzer, edits, bit, revisions, isolated_test_paths):
     if (analyzer.location_observers(all_dynamic=True) | analyzer.state_refs.mask("*module")) & bit:
         return False
     for path, source in edits.items():
+        if analyzer.index["reads"].get(path, 0) & bit:
+            return False
+        file = analyzer.base / path
+        if not file.is_file() or (path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777):
+            return False
         if path in isolated_test_paths:
             if isolated_test_paths[path] & bit:
                 return False
-        elif not unchanged_module_workload(analyzer, edits, path, source, bit, revisions.get(path),
-                                          parser_only=len(edits) > 1):
+        elif not unchanged_module_workload(analyzer, path, source, bit, revisions.get(path),
+                                           parser_only=parser_only):
             return False
     return True

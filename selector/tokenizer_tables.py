@@ -203,6 +203,61 @@ def _identifier_tokens(node, known):
     return members, spreads, ast.dump(node.right)
 
 
+def table_query_cases(analyzer, edits, isolated, revisions, mask):
+    """A disabled TABLE feature can affect only cases that got past its guards."""
+    from .analyze import _get_func_node
+    from .query_cases import reached_cases
+
+    if edits.keys() - isolated.keys() != {BASE_PARSER} or BASE_PARSER not in revisions:
+        return {}
+    mask &= ~analyzer.location_observers(all_dynamic=True)
+    for path in edits:
+        mask &= ~(analyzer.index["reads"].get(path, 0) | isolated.get(path, 0))
+    if not mask:
+        return {}
+    source = edits[BASE_PARSER]
+    file = analyzer.base / BASE_PARSER
+    if BASE_PARSER in edits.modes and edits.modes[BASE_PARSER] != file.stat().st_mode & 0o777:
+        return {}
+    field = "SUPPORTS_TABLE_QUERY"
+    old, _ = analyzer.old_tree_and_lines(BASE_PARSER)
+    new = revisions[BASE_PARSER][0]
+    left, right = (_class_field(tree, "BaseParser", field) for tree in (old, new))
+    if (left is None or right is None or not isinstance(left.value, ast.Constant) or left.value.value is not True
+            or not isinstance(right.value, ast.Constant) or right.value.value is not False):
+        return {}
+    revised = right.value
+    right.value = left.value
+    try:
+        if ast.dump(old) != ast.dump(new) or not same_directive_lines(file.read_bytes(), source):
+            return {}
+    finally:
+        right.value = revised
+
+    tree, _ = analyzer.old_tree_and_lines(PARSER)
+    fn = _get_func_node(tree, "Parser._is_table_query")
+    if fn is None or len(fn.body) != 1 or not isinstance(fn.body[0], ast.Return):
+        return {}
+    guard = fn.body[0].value
+    if (not isinstance(guard, ast.BoolOp) or not isinstance(guard.op, ast.And)
+            or len(guard.values) != 3 or not is_expression(guard.values[0], "self.SUPPORTS_TABLE_QUERY")
+            or not is_expression(guard.values[1], "self._curr.token_type == TokenType.TABLE")
+            or guard.values[2].lineno <= guard.values[1].end_lineno):
+        return {}
+    for path, lines in analyzer.state_refs.refs.get(field, {}).items():
+        readers = set(lines) - ({guard.values[0].lineno} if path == PARSER else set())
+        mask &= ~analyzer._lines_and_indirect_mask(path, readers)
+    # If the line after the TABLE check was not reached, the old call also
+    # returned False. The exact TokenType comparison has no side effects.
+    return {
+        n: [i for i in range(count) if hit & (1 << i)]
+        for n, (count, masks, files) in analyzer.queries.maps.items()
+        if mask & (1 << n)
+        and (hit := reached_cases(masks, files, PARSER,
+                                 [(guard.values[2].lineno, guard.values[2].end_lineno)])).bit_count() < count
+    }
+
+
 def unchanged_limit_config(analyzer, edits, isolated, revisions, bit):
     paths = edits.keys() - isolated.keys()
     if len(paths) != 1 or analyzer.location_observers(all_dynamic=True) & bit:

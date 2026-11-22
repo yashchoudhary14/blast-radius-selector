@@ -41,7 +41,7 @@ def executor_inputs(rows):
     return [(sql, bool(dict(meta).get("execute"))) for meta, sql, _ in rows]
 
 
-def fixture_effects(analyzer, edits, other_mask):
+def fixture_effects(analyzer, edits, other_mask, revisions):
     """Return safe whole-test omissions and changed query indices."""
     fixtures = edits.keys() & PROJECTED_FIXTURES
     if len(fixtures) != 1:
@@ -54,7 +54,7 @@ def fixture_effects(analyzer, edits, other_mask):
 
     keep = other_mask
     for other in edits.keys() - fixtures:
-        if not companion_equivalent(analyzer, edits, other):
+        if not companion_equivalent(analyzer, edits, other, revisions.get(other)):
             return 0, {}
         keep |= analyzer.index["reads"].get(other, 0)
         if other.endswith(".py"):
@@ -101,7 +101,7 @@ def same_mode(file, edits, path):
     return edits.modes.get(path, mode) == mode
 
 
-def companion_equivalent(analyzer, edits, path):
+def companion_equivalent(analyzer, edits, path, revision):
     file = analyzer.base / path
     source = edits[path]
     if source is None or not file.is_file() or not same_mode(file, edits, path):
@@ -114,9 +114,15 @@ def companion_equivalent(analyzer, edits, path):
         return False
     before = file.read_bytes()
     original, diagnostics = analyzer.old_compiled(path)
-    revised, new_diagnostics = compile_source(source, path)
-    if diagnostics or new_diagnostics:
+    if diagnostics:
         return False
+    if revision is None:
+        revised, diagnostics = compile_source(source, path)
+        if diagnostics:
+            return False
+    else:
+        # Analyzer caches a revision only after rejecting changed diagnostics.
+        revised = revision[1]
     insertion = line_insertion(before, source)
     return ((same_code(original, revised) or (insertion and relocated_code(original, revised, insertion)))
             and same_directives(before, source, insertion))

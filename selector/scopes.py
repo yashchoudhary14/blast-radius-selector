@@ -15,7 +15,7 @@ def structural(node):
     return digest(ast.dump(node, include_attributes=False).encode("utf-8", "surrogatepass"))
 
 
-def snapshot(tree, source, cached=None):
+def snapshot(tree, source, cached=None, *, scopes_only=False):
     """Structurally hash function headers and bodies using AST comparison."""
     functions, scopes = {}, {}
     saved = []
@@ -52,6 +52,8 @@ def snapshot(tree, source, cached=None):
             order.append(name)
             if isinstance(stmt, ast.ClassDef):
                 visit(stmt, name + ".")
+                continue
+            if scopes_only:
                 continue
             visit_nested_funcs(stmt, name + ".")
             start = min([stmt.lineno, *(d.lineno for d in stmt.decorator_list)])
