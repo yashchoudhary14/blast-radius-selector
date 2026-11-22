@@ -349,6 +349,29 @@ def docstring_only(old_source, source, old_tree, tree, before, after):
     return bool(result and result[2] and not result[3])
 
 
+def redundant_abc_metaclass(old, new):
+    originals = {node.name: node for node in old.body if isinstance(node, ast.ClassDef)}
+    for cls in new.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name not in originals:
+            continue
+        prior = originals[cls.name]
+        if (len(prior.bases) != 1 or ast.unparse(prior.bases[0]) != "abc.ABC"
+                or prior.keywords or len(cls.keywords) != 1):
+            continue
+        keyword = cls.keywords[0]
+        if keyword.arg != "metaclass" or ast.unparse(keyword.value) != "abc.ABCMeta":
+            continue
+        # __build_class__ already resolves this metaclass from the sole base.
+        # The explicit keyword is consumed before the same ABCMeta call.
+        keywords, cls.keywords = cls.keywords, []
+        try:
+            if ast.dump(old) == ast.dump(new):
+                return True
+        finally:
+            cls.keywords = keywords
+    return False
+
+
 def _get_func_ast(tree, name):
     node = tree
     for part in name.split(".")[:-1]:
