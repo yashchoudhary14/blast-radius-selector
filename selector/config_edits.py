@@ -2,6 +2,7 @@
 
 import ast
 from collections import Counter
+from copy import copy
 
 from .scopes import snapshot
 
@@ -33,8 +34,12 @@ def _declaration(node, postponed):
     return name.id
 
 
-def configuration_changes(path, original, updated):
+def configuration_changes(path, old, new, old_functions, new_functions):
     """Report scalar class changes when other edits only modify function bodies."""
+    if (old_functions.keys() != new_functions.keys()
+            or any(row[1] != new_functions[name][1] for name, row in old_functions.items())):
+        return set()
+
     def declarations(tree):
         postponed = any(isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
                         and any(name.name == "annotations" for name in stmt.names) for stmt in tree.body)
@@ -59,25 +64,27 @@ def configuration_changes(path, original, updated):
                 values[cls.name, name] = tuple(nodes)
         return values
 
-    def project(tree, source, assignments):
+    def project(tree, assignments):
         remove = {node for key in changed for node in assignments.get(key, ())}
+        projected = copy(tree)
+        projected.body = []
         for cls in tree.body:
             if isinstance(cls, ast.ClassDef):
                 doc = ast.get_docstring(cls, clean=False)
+                cls = copy(cls)
                 cls.body = [node for node in cls.body if node not in remove]
                 if ast.get_docstring(cls, clean=False) != doc:
                     return None
-        funcs, scopes = snapshot(tree, source)
-        return {name: parts[1] for name, parts in funcs.items()}, scopes
+            projected.body.append(cls)
+        return snapshot(projected, b"", scopes_only=True)[1]
 
-    old, new = ast.parse(original), ast.parse(updated)
     left, right = declarations(old), declarations(new)
     changed = {key for key in left.keys() | right.keys()
                if tuple(map(ast.dump, left.get(key, ()))) != tuple(map(ast.dump, right.get(key, ())))}
     if not changed:
         return set()
-    before = project(old, original, left)
-    after = project(new, updated, right)
+    before = project(old, left)
+    after = project(new, right)
     if before is None or before != after:
         return set()
     return {name for _, name in changed}

@@ -1650,7 +1650,8 @@ class Analyzer:
             )
         configuration = set()
         if dirty and dialect_code:
-            configuration = configuration_changes(path, (self.base / path).read_bytes(), new)
+            old_tree, _ = self.old_tree_and_lines(path)
+            configuration = configuration_changes(path, old_tree, new_tree_for_stmts, old_funcs, new_funcs)
             if configuration:
                 dirty.clear()
                 out.broad |= self.location_observers() & self.importers[path]
