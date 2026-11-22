@@ -5,6 +5,7 @@ import functools
 from collections import Counter
 
 from .source_equivalence import _binds, _same_directives_text_only
+from .state_refs import _pure_re_compile, _re_is_clean
 
 
 # SQLGlot's unchanged package preamble loads collections.abc, builtins and
@@ -12,7 +13,9 @@ from .source_equivalence import _binds, _same_directives_text_only
 CACHED_IMPORTS = {"builtins", "collections", "functools", "typing"}
 
 
-def literal(node):
+def literal(node, *, re_safe=False):
+    if re_safe and _pure_re_compile(node):
+        return True
     if isinstance(node, ast.SetComp):
         # A comprehension over exact strings calls only the built-in str.lower.
         if len(node.generators) != 1:
@@ -32,14 +35,15 @@ def literal(node):
     return True
 
 
-def declaration(node, postponed):
+def declaration(node, postponed, *, re_safe=False):
     if isinstance(node, ast.Assign) and len(node.targets) == 1:
         target = node.targets[0]
     elif isinstance(node, ast.AnnAssign) and node.simple and postponed and node.value is not None:
         target = node.target
     else:
         return None
-    if isinstance(target, ast.Name) and target.id.isupper() and not target.id.startswith("__") and literal(node.value):
+    if (isinstance(target, ast.Name) and target.id.isupper() and not target.id.startswith("__")
+            and literal(node.value, re_safe=re_safe)):
         return target.id
     return None
 
@@ -119,8 +123,10 @@ def bindings(before, after, path):
     functions = new_private_functions(old, new, postponed) if allow_imports else []
     fresh.update(fn.name for fn in functions)
 
+    re_safe = _re_is_clean(old)
+
     def declarations(tree):
-        rows = [(name, node) for node in tree.body if (name := declaration(node, postponed))]
+        rows = [(name, node) for node in tree.body if (name := declaration(node, postponed, re_safe=re_safe))]
         counts = Counter(name for name, _ in rows)
         return {name: node for name, node in rows if counts[name] == 1}
 
@@ -155,6 +161,6 @@ def reference_lines(analyzer, path, name, preserve_binding):
             # Copying an existing binding is safe. A renamed copy needs its
             # own reference analysis, so its import line remains a reader.
             aliases = [alias for alias in statement.names if alias.name == name]
-            if aliases and all(alias.asname is None for alias in aliases):
+            if aliases and all(alias.asname is None or alias.asname == name for alias in aliases):
                 lines.discard(statement.lineno)
     return lines

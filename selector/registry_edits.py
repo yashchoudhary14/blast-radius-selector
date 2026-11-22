@@ -49,28 +49,47 @@ def _expression_field(name, value):
     return name == "is_var_len_args" and isinstance(value, ast.Constant) and type(value.value) is bool
 
 
-def _metadata_entry(key, value):
-    if key is not None or not isinstance(value, ast.DictComp) or len(value.generators) != 1:
+def _dtype_name(node):
+    if not (isinstance(node, ast.Dict) and len(node.keys) == 1
+            and isinstance(node.keys[0], ast.Constant) and node.keys[0].value == "returns"):
         return None
-    loop = value.generators[0]
-    dtype = value.value
-    if not (isinstance(value.key, ast.Name) and isinstance(loop.target, ast.Name)
-            and loop.target.id == value.key.id and not loop.ifs and not loop.is_async
-            and isinstance(loop.iter, ast.Set) and isinstance(dtype, ast.Dict)
-            and len(dtype.keys) == 1 and isinstance(dtype.keys[0], ast.Constant)
-            and dtype.keys[0].value == "returns"):
-        return None
-    enum = dtype.values[0]
+    enum = node.values[0]
     if not (isinstance(enum, ast.Attribute) and isinstance(enum.value, ast.Attribute)
             and enum.value.attr == "DType" and isinstance(enum.value.value, ast.Name)
             and enum.value.value.id == "exp"):
         return None
-    names = set()
-    for node in loop.iter.elts:
-        if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp"):
+    return enum.attr
+
+
+def _exp_name(node):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp":
+        return node.attr
+    return None
+
+
+def _metadata_entry(key, value):
+    if key is not None:
+        name = _exp_name(key)
+        dtype = _dtype_name(value)
+        if name is None or dtype is None:
             return None
-        names.add(node.attr)
-    return enum.attr, names
+        return dtype, {name}, ("direct", dtype, name)
+    if not isinstance(value, ast.DictComp) or len(value.generators) != 1:
+        return None
+    loop = value.generators[0]
+    if not (isinstance(value.key, ast.Name) and isinstance(loop.target, ast.Name)
+            and loop.target.id == value.key.id and not loop.ifs and not loop.is_async
+            and isinstance(loop.iter, ast.Set)):
+        return None
+    names = {_exp_name(node) for node in loop.iter.elts}
+    if not names or None in names:
+        return None
+    dtype = _dtype_name(value.value)
+    if dtype is not None:
+        return dtype, names, ("returns", dtype)
+    if isinstance(value.value, ast.Dict):
+        return None, names, ("comp", ast.dump(value.value))
+    return None
 
 
 def changed_metadata(old, new):
@@ -97,7 +116,7 @@ def changed_metadata(old, new):
     # A group's order among the groups can determine shadowing. Compare
     # signatures after removing only groups with no keys in the other version.
     def labels(mapping, groups):
-        return [("returns", groups[i][0]) if i in groups else (ast.dump(key) if key else None, ast.dump(value))
+        return [groups[i][2] if i in groups else (ast.dump(key) if key else None, ast.dump(value))
                 for i, (key, value) in enumerate(zip(mapping.keys, mapping.values))]
 
     expressions, dtypes = set(), set()
@@ -107,14 +126,15 @@ def changed_metadata(old, new):
             for a, b in zip(range(i, j), range(k, l)):
                 if a in before and b in after and before[a][1] != after[b][1]:
                     expressions.update(before[a][1] ^ after[b][1])
-                    dtypes.add(after[b][0])
+                    if after[b][0] is not None:
+                        dtypes.add(after[b][0])
                     right.values[b] = left.values[a]
             continue
         for groups, indices, dropped in ((before, range(i, j), removed), (after, range(k, l), added)):
             for idx in indices:
-                if idx not in groups:
+                if idx not in groups or groups[idx][0] is None:
                     return set(), set()
-                dtype, names = groups[idx]
+                dtype, names, _ = groups[idx]
                 expressions.update(names)
                 dtypes.add(dtype)
                 dropped.add(idx)

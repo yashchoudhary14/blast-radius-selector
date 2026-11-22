@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+import functools
 from functools import lru_cache
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from .core_headers import (inert_header, only_nested_definitions, private_consta
 from .dialect_cases import isolated_test_methods
 from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
-from .fixture_cases import unaffected_fixture_tests
+from .fixture_cases import TPC_DS, TPC_H, fixture_case_subsets, unaffected_fixture_tests
 from .memory_edits import same_memory_workload
 from .operands import narrow
 from .parser_payload import unchanged_limit_assertions
@@ -783,11 +784,7 @@ class Analyzer:
             kind, owner, is_plain, relocated = doc_res
             loc = self.location_observers() if relocated else 0
             if is_plain:
-                mask = self.doc_observers() | loc
-                # H2 also handles same-height module and plain top-level class docs.
-                if not relocated and (kind == "module" or (kind == "class" and "." not in owner)):
-                    mask |= self.state_refs.mask("*") | self.state_refs.mask("*sqlvalue")
-                return mask
+                return self.doc_observers() | loc
             if kind == "class" and path.startswith("sqlglot/expressions/") and self.expr_owners(path, {owner}):
                 return self.doc_observers() | loc
             if kind == "class" and probe is not None:
@@ -897,9 +894,16 @@ class Analyzer:
                                   p.startswith("sqlglot/") and p.endswith(".py")
                                   and p != "sqlglot/__main__.py" and data is not None
                                   and (self.base / p).is_file()) for p, data in edits.items())) else None
+        tpc_fixtures = []
         for path, new in edits.items():
             p = Path(path)
             readers = self.index["reads"].get(path, 0)
+            created = new is not None and not (self.base / path).is_file()
+            if path in (TPC_DS, TPC_H) and not created and new is not None and readers:
+                mode = (self.base / path).stat().st_mode & 0o777
+                if edits.modes.get(path, mode) == mode:
+                    tpc_fixtures.append((path, readers))
+                    continue
             dialect_test = path.startswith("tests/dialects/") and p.match("test_*.py")
             out.direct |= readers
             out.priority |= readers
@@ -1008,7 +1012,19 @@ class Analyzer:
                 if path.startswith("sqlglot/typing/") and new is not None:
                     mask = self.typing_readers(path, new, new_classes)
                     if mask is not None:
-                        if concrete_edits and concrete(path, "typing"):
+                        typing_safe = all(
+                            p in isolated_tests
+                            or concrete_edit(p, d)
+                            or (
+                                p == "sqlglot/typing/__init__.py"
+                                and d is not None
+                                and (self.base / p).is_file()
+                                and edits.modes.get(p, (self.base / p).stat().st_mode & 0o777)
+                                == ((self.base / p).stat().st_mode & 0o777)
+                            )
+                            for p, d in edits.items()
+                        )
+                        if typing_safe and (concrete(path, "typing") or path == "sqlglot/typing/__init__.py"):
                             original = (self.base / path).read_bytes()
                             if same_directive_lines(original, new):
                                 names, _ = changed_metadata(ast.parse(original), ast.parse(new))
@@ -1052,14 +1068,27 @@ class Analyzer:
                     out.direct &= ~omit
                     out.broad &= ~omit
                     out.priority &= ~omit
+        other_mask = out.mask
+        for path, readers in tpc_fixtures:
+            out.direct |= readers
+            out.priority |= readers
+            if readers & memory_bit:
+                out.dialect_subset_safe = False
+            if shared_edit:
+                out.query_blocked |= readers
+            out.query_spans[path] = None
         if not out.broken and not out.structural:
-            omit = unaffected_fixture_tests(self, edits)
-            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit):
+            omit = unaffected_fixture_tests(self, edits, other_mask=other_mask)
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, candidates=out):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
+        if not out.broken and not out.structural and tpc_fixtures:
+            for number, indices in fixture_case_subsets(self, edits, other_mask=other_mask).items():
+                if number in self.queries.maps and out.mask & (1 << number):
+                    out.query_subsets[number] = indices
         number = self.num.get(MAX_NODES)
         if (not out.broken and not out.structural and number in self.queries.maps
                 and out.mask & ~out.query_blocked & (1 << number)
@@ -1223,11 +1252,23 @@ class Analyzer:
                     stars.add(_resolve_import_from(rel, node))
         return stars
 
-    def _unused_added_imports(self, path, old_tree, new_tree, rows):
+    @lru_cache(maxsize=1)
+    def _star_reexporters(self):
+        reexporters = defaultdict(set)
+        for file in sorted((self.base / "sqlglot").rglob("__init__.py")):
+            rel = file.relative_to(self.base).as_posix()
+            mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
+            tree, _ = self.old_tree_and_lines(rel)
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                    reexporters[_resolve_import_from(rel, node)].add((mod, rel))
+        return reexporters
+
+    def _unused_added_imports(self, path, old_tree, new_tree, rows=None):
         old_dumps = [ast.dump(s) for s in old_tree.body]
         new_dumps = [ast.dump(s) for s in new_tree.body]
         sm = SequenceMatcher(None, old_dumps, new_dumps, autojunk=False)
-        added_aliases = []  # (mod_name, bound_name)
+        added_aliases = []  # (mod_name, orig_name, bound_name)
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 continue
@@ -1235,13 +1276,13 @@ class Analyzer:
                 for stmt in new_tree.body[j1:j2]:
                     if isinstance(stmt, ast.Import):
                         for a in stmt.names:
-                            added_aliases.append((a.name, a.asname or a.name.partition(".")[0]))
+                            added_aliases.append((a.name, a.name, a.asname or a.name.partition(".")[0]))
                     elif isinstance(stmt, ast.ImportFrom):
                         if any(a.name == "*" for a in stmt.names) or stmt.module == "__future__":
                             return False
                         mod = _resolve_import_from(path, stmt)
                         for a in stmt.names:
-                            added_aliases.append((mod, a.asname or a.name))
+                            added_aliases.append((mod, a.name, a.asname or a.name))
                     else:
                         return False
             elif tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
@@ -1263,10 +1304,17 @@ class Analyzer:
                         return False
                     mod = None if isinstance(n_stmt, ast.Import) else _resolve_import_from(path, n_stmt)
                     for a in n_stmt.names[aj1:aj2]:
-                        added_aliases.append((a.name if mod is None else mod, a.asname or a.name.partition(".")[0] if mod is None else a.asname or a.name))
+                        if mod is None:
+                            added_aliases.append((a.name, a.name, a.asname or a.name.partition(".")[0]))
+                        else:
+                            added_aliases.append((mod, a.name, a.asname or a.name))
             else:
                 return False
         if not added_aliases:
+            return False
+        if rows is None and not all(
+            mod == "functools" and orig in vars(functools) for mod, orig, _ in added_aliases
+        ):
             return False
         old_imported = set()
         for stmt in old_tree.body:
@@ -1274,49 +1322,66 @@ class Analyzer:
                 old_imported.update(a.name for a in stmt.names)
             elif isinstance(stmt, ast.ImportFrom):
                 old_imported.add(_resolve_import_from(path, stmt))
-        for mod, _ in added_aliases:
+        for mod, _, _ in added_aliases:
             if mod == "__future__" or not (mod.partition(".")[0] in sys.stdlib_module_names or mod in old_imported):
                 return False
-        added_names = {name for _, name in added_aliases}
-        for node in ast.walk(old_tree):
-            if isinstance(node, ast.Name):
-                if node.id in added_names or node.id == "__all__":
-                    return False
-            elif isinstance(node, ast.alias):
-                bound = node.asname or node.name.partition(".")[0]
-                if bound in added_names or node.name in added_names:
-                    return False
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name in added_names or node.name == "__getattr__":
-                    return False
-            elif isinstance(node, ast.arg) and node.arg in added_names:
+        added_names = {name for _, _, name in added_aliases}
+
+        def module_unused(mod_path, mod_name, tree):
+            if mod_path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/")):
                 return False
-            elif isinstance(node, (ast.Global, ast.Nonlocal)) and added_names.intersection(node.names):
-                return False
-            elif isinstance(node, ast.Call):
-                fn = node.func
-                callee = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
-                if callee in ("globals", "locals", "vars", "dir"):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    if node.id in added_names or node.id == "__all__":
+                        return False
+                elif isinstance(node, ast.alias):
+                    bound = node.asname or node.name.partition(".")[0]
+                    if bound in added_names or node.name in added_names:
+                        return False
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name in added_names or node.name == "__getattr__":
+                        return False
+                elif isinstance(node, ast.arg) and node.arg in added_names:
                     return False
+                elif isinstance(node, (ast.Global, ast.Nonlocal)) and added_names.intersection(node.names):
+                    return False
+                elif isinstance(node, ast.Call):
+                    fn = node.func
+                    callee = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+                    if callee in ("globals", "locals"):
+                        return False
+                    if callee in ("vars", "dir") and (
+                        not node.args or any("modules" in ast.dump(a) or "__name__" in ast.dump(a) for a in node.args)
+                    ):
+                        return False
+            if mod_name in self._test_star_imports():
+                return False
+            for attr in added_names:
+                if attr in self.state_refs.fields:
+                    return False
+                for ref_path in self.state_refs.refs.get(attr, ()):
+                    if ref_path == mod_path:
+                        continue
+                    ref_tree, _ = self.old_tree_and_lines(ref_path)
+                    for node in ast.walk(ref_tree):
+                        if isinstance(node, ast.ImportFrom) and any(a.name == attr for a in node.names):
+                            target = _resolve_import_from(ref_path, node)
+                            if target == mod_name or f"{target}.{attr}" == mod_name:
+                                return False
+            return True
+
         mod_name = path[:-3].replace("/", ".").removesuffix(".__init__")
-        if not all(r[0] == mod_name and r[1] in added_names for r in rows):
+        if not module_unused(path, mod_name, old_tree):
             return False
-        if mod_name in self._test_star_imports():
-            return False
-        for attr in added_names:
-            if attr in self.state_refs.fields:
+        reexporters = {rmod: rpath for rmod, rpath in self._star_reexporters().get(mod_name, ())}
+        for rmod, rpath in reexporters.items():
+            rtree, _ = self.old_tree_and_lines(rpath)
+            if not module_unused(rpath, rmod, rtree):
                 return False
-            for ref_path in self.state_refs.refs.get(attr, ()):
-                if ref_path == path:
-                    continue
-                ref_tree, _ = self.old_tree_and_lines(ref_path)
-                for node in ast.walk(ref_tree):
-                    if isinstance(node, ast.ImportFrom) and any(a.name == attr for a in node.names):
-                        target = _resolve_import_from(ref_path, node)
-                        if target == mod_name or f"{target}.{attr}" == mod_name:
-                            return False
-        if path.startswith(("sqlglot/dialects/", "sqlglot/optimizer/")):
-            return False
+        if rows is not None:
+            allowed_mods = {mod_name, *reexporters}
+            if not all(r[0] in allowed_mods and r[1] in added_names for r in rows):
+                return False
         return True
 
     def _dict_value_candidates(self, path, old_tree, new_bytes, rows=None):
@@ -1624,6 +1689,7 @@ class Analyzer:
 
         safe_headers, query_defaults = {}, {}
         removed_keywords = {}
+        query_frame_changed = False
         if (dialect_code or shared_core(path)) and not scope_edit:
             changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
                                if old_funcs[q][1] != new_funcs[q][1]]
@@ -1719,6 +1785,8 @@ class Analyzer:
                         code = functions(compiled)
                     old_frame, new_frame = self.old_code(path).get(q), code.get(q)
                     frame_changed = changes_frame_bindings(old_frame, new_frame)
+                    if frame_changed:
+                        query_frame_changed = True
                     if (frame_changed and shared_core(path) and removed_cells(old_frame, new_frame)):
                         frame_changed = False
                         relocated_cells = True
@@ -1797,7 +1865,9 @@ class Analyzer:
                     for q, old in old_funcs.items() if old[2] != new_funcs[q][2]
                 ]
                 out.query_blocked |= self.signature_observers(path, args_changed=False) | self.state_refs.mask("co_varnames")
-            else:
+            elif query_frame_changed or not shared_core(path):
+                # G6: on shared-core files only a frame-binding change voids case spans; elsewhere keep
+                # the conservative rule (any layout change voids them).
                 out.query_spans[path] = None
         literal_default_only = (query_defaults and old_scopes == new_scopes
                                 and old_funcs.keys() == new_funcs.keys()
@@ -1991,6 +2061,11 @@ class Analyzer:
             return None, False
 
         refined = None
+        if dirty == {""} and scope_edit and not changed and not diagnostics and single_edit:
+            old_tree, _ = self.old_tree_and_lines(path)
+            if _same_directives_text_only(base_src, new) and self._unused_added_imports(path, old_tree, new_tree_for_stmts):
+                out.broad |= self.location_observers()
+                return
         if dirty and scope_edit and probe:
             reason, mark_broken = skip_reason()
             if reason is not None:
