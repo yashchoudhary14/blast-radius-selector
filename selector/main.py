@@ -110,6 +110,12 @@ def lane(execution, millis, patches, dst, start, deadline, static, fallback, *, 
                 workers = all_workers
                 audit = dict(reason=exc.reason if isinstance(exc, PatchError) else "exception",
                              stage=stage, error=repr(exc))
+            # DIAGNOSTIC VARIANT (not a contender): commits priced in (20000, 10000000] ms run nothing.
+            try:
+                if 20000 < cost <= 10000000:
+                    workers = []
+            except NameError:
+                pass
             emit(path.stem, workers, audit)
 
 
