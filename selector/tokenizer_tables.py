@@ -5,13 +5,18 @@ import re
 
 from .comment_cases import is_expression
 from .dialect_tables import same_directive_lines
+from .generator_modifiers import modifier_order_readers, render_modifier_edit
 
 
 TOKENS = "sqlglot/tokens.py"
 TOKENIZER_CORE = "sqlglot/tokenizer_core.py"
 TRIE = "sqlglot/trie.py"
+PARSER = "sqlglot/parser.py"
+BASE_PARSER = "sqlglot/parsers/base.py"
+GENERATOR = "sqlglot/generator.py"
 LIMIT_WORDS = {"SELECT", "FROM", "T", "X", *(f"COL{i}" for i in range(500))}
 LIMIT_CHARS = set("".join(LIMIT_WORDS) + ",= 0123456789")
+LIMIT_TYPES = {"SELECT", "FROM", "VAR", "IDENTIFIER", "COMMA", "EQ", "NUMBER", "SENTINEL"}
 COMPARISON = re.compile(rb"\b(?:comments|sub)\s*==")
 
 
@@ -164,3 +169,87 @@ def unchanged_limit_tokens(analyzer, edits, bit):
     else:
         changed = normalize_trie_terminal(new)
     return changed and ast.dump(old) == ast.dump(new) and same_directive_lines(file.read_bytes(), source)
+
+
+def _class_field(tree, owner, field):
+    fields = []
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name != owner:
+            continue
+        for stmt in cls.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                lhs = stmt.targets[0]
+            elif isinstance(stmt, ast.AnnAssign):
+                lhs = stmt.target
+            else:
+                continue
+            if isinstance(lhs, ast.Name) and lhs.id == field:
+                fields.append(stmt)
+    return fields[0] if len(fields) == 1 else None
+
+
+def _identifier_tokens(node, known):
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub) and isinstance(node.left, ast.Set)):
+        return None
+    members, spreads = set(), []
+    for item in node.left.elts:
+        if isinstance(item, ast.Starred) and isinstance(item.value, ast.Name):
+            spreads.append(item.value.id)
+        elif (isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name)
+              and item.value.id == "TokenType" and item.attr in known):
+            members.add(item.attr)
+        else:
+            return None
+    return members, spreads, ast.dump(node.right)
+
+
+def unchanged_limit_config(analyzer, edits, isolated, revisions, bit):
+    paths = edits.keys() - isolated.keys()
+    if len(paths) != 1 or analyzer.location_observers(all_dynamic=True) & bit:
+        return False
+    if any((analyzer.index["reads"].get(path, 0) | isolated.get(path, 0)) & bit for path in edits):
+        return False
+    path = next(iter(paths))
+    if path not in (PARSER, BASE_PARSER, GENERATOR) or path not in revisions:
+        return False
+    file = analyzer.base / path
+    if path in edits.modes and edits.modes[path] != file.stat().st_mode & 0o777:
+        return False
+    before, after = file.read_bytes(), edits[path]
+    if path == GENERATOR:
+        # Copies and fixed-key lookups see the same callbacks. Only an
+        # iteration can observe the relative order of the moved entries.
+        return (render_modifier_edit(before, after, path, order_only=True)
+                and not modifier_order_readers(analyzer) & bit)
+    old, _ = analyzer.old_tree_and_lines(path)
+    new = revisions[path][0]
+    if path == BASE_PARSER:
+        owner, field = "BaseParser", "SUPPORTS_TABLE_QUERY"
+    else:
+        owner, field = "Parser", "ID_VAR_TOKENS"
+    left, right = (_class_field(tree, owner, field) for tree in (old, new))
+    if left is None or right is None:
+        return False
+    prior, revised = left.value, right.value
+    if ast.dump(prior) == ast.dump(revised):
+        return False
+    if path == BASE_PARSER:
+        # The sole runtime read enables TABLE queries. None of the pinned
+        # limit inputs provides a TABLE token.
+        if not all(isinstance(value, ast.Constant) and type(value.value) is bool for value in (prior, revised)):
+            return False
+    else:
+        known = analyzer.dialect_reads.known_tokens()
+        old_table, new_table = (_identifier_tokens(value, known) for value in (prior, revised))
+        if old_table is None or new_table is None or old_table[1:] != new_table[1:]:
+            return False
+        original_set, updated_set = old_table[0], new_table[0]
+        # VAR keeps the pinned default parser's derived alias sets nonempty.
+        # Membership of every token the stress inputs can supply is unchanged.
+        if "VAR" not in original_set & updated_set or (original_set ^ updated_set) & LIMIT_TYPES:
+            return False
+    right.value = prior
+    try:
+        return ast.dump(old) == ast.dump(new) and same_directive_lines(before, after)
+    finally:
+        right.value = revised

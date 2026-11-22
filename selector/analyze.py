@@ -23,8 +23,9 @@ from .config_edits import added_methods, configuration_changes
 from .core_headers import (inert_header, only_nested_definitions, private_constants,
                            retired_dialect_bindings, schema_methods, shared_core)
 from .dialect_cases import isolated_test_methods
-from .dialect_tables import DialectTableReads, concrete, same_directive_lines, table_changes
+from .dialect_tables import DialectTableReads, concrete, copied_dialect_values, same_directive_lines, table_changes
 from .dialect_time import time_changes, time_readers
+from .executor_plan import unaffected_plan_tests
 from .fixture_cases import unaffected_fixture_tests
 from .memory_edits import same_memory_workload
 from .operands import narrow
@@ -40,7 +41,7 @@ from .source_equivalence import (_same_directives_text_only, added_binding, comp
                                  text_message_only, type_checking_imports)
 from .state_refs import StateRefs, data_only, functions, same_runtime_declarations, signature
 from .test_edits import method_changes
-from .tokenizer_tables import unchanged_limit_tokens
+from .tokenizer_tables import unchanged_limit_config, unchanged_limit_tokens
 from .workers import schedule
 
 COMPOUND = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try, ast.Match)
@@ -802,6 +803,9 @@ class Analyzer:
         if diagnostics:
             return None
         old_tree, _ = self.old_tree_and_lines(path)
+        if (path == "sqlglot/dialects/__init__.py" and out is not None and len(out.paths) == 1 and scope_edits
+                and copied_dialect_values(old_tree, new_tree) and same_directives(old, new)):
+            return self.location_observers(all_dynamic=True) | self.index["heap_observers"]
         if insertion:
             if relocated_code(before, compiled, insertion):
                 if same_directives(old, new, insertion):
@@ -1135,11 +1139,16 @@ class Analyzer:
             out.broad &= ~omit
             out.priority &= ~omit
         out.query_subsets = self.queries.subsets(out, edits)
+        if not out.broken and not out.structural:
+            for number in numbers(unaffected_plan_tests(self, edits, revisions, out.mask)):
+                out.query_subsets[number] = []
         number = self.num.get(MAX_NODES)
         if (not out.broken and not out.structural and number in self.queries.maps
-                and out.mask & ~out.query_blocked & (1 << number)
-                and (unchanged_limit_assertions(self, edits, 1 << number)
-                     or unchanged_limit_tokens(self, edits, 1 << number))):
+                and out.mask & (1 << number)
+                and ((not out.query_blocked & (1 << number)
+                      and (unchanged_limit_assertions(self, edits, 1 << number)
+                           or unchanged_limit_tokens(self, edits, 1 << number)))
+                     or unchanged_limit_config(self, edits, isolated_tests, revisions, 1 << number))):
             out.query_subsets[number] = []
         if (not out.broken and production_count and
                 edits.keys() - isolated_tests.keys() <= {"sqlglot/parser.py", "sqlglot/tokenizer_core.py"}):

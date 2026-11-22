@@ -24,6 +24,27 @@ def same_directive_lines(before, after):
             and tuple(row[1:] for row in original) == tuple(row[1:] for row in updated))
 
 
+def copied_dialect_values(old, new):
+    def view(tree):
+        rows = [node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "DIALECT_MODULE_NAMES"]
+        return rows[0] if len(rows) == 1 else None
+
+    before, after = (view(tree) for tree in (old, new))
+    if before is None or after is None or ast.unparse(after.value) not in {
+        "dict(MODULE_BY_DIALECT).values()", "MODULE_BY_DIALECT.copy().values()",
+    }:
+        return False
+    # The pinned package never mutates MODULE_BY_DIALECT. Consumers of the
+    # view use membership, length and iteration over the same ordered values.
+    revised = after.value
+    after.value = before.value
+    try:
+        return ast.dump(old) == ast.dump(new)
+    finally:
+        after.value = revised
+
+
 def concrete(path, family):
     parts = PurePosixPath(path).parts
     return (len(parts) == 3 and parts[:2] == ("sqlglot", family)

@@ -1,7 +1,9 @@
 """Prove that unread constants cannot change the generator allocation loop."""
 
 import ast
+from copy import copy
 
+from .core_headers import inert_header
 from .dialect_tables import concrete, same_directive_lines
 from .query_bindings import bindings, declaration
 from .query_cases import frame_layout
@@ -64,7 +66,7 @@ def dormant_bodies(analyzer, path, tree, compiled, before, after, bit):
     from .analyze import _get_func_node
 
     changed = [name for name, row in before.items() if row[:3] != after[name][:3]]
-    if not changed or any(before[name][1] != after[name][1] for name in changed):
+    if not changed:
         return False
     old_tree, _ = analyzer.old_tree_and_lines(path)
     for name in changed:
@@ -74,6 +76,20 @@ def dormant_bodies(analyzer, path, tree, compiled, before, after, bit):
                 or ast.get_docstring(fn, clean=False) != ast.get_docstring(updated, clean=False)
                 or analyzer._lines_and_indirect_mask(path, range(fn.body[0].lineno, fn.end_lineno + 1)) & bit):
             return False
+        if before[name][1] != after[name][1]:
+            old_code, _ = analyzer.old_compiled(path)
+            if ((analyzer.signature_observers(path) | analyzer.state_refs.mask("signature")) & bit
+                    or inert_header(fn, updated, old_code.co_flags, compiled.co_flags) != "default"):
+                return False
+            # Verify that the restored literal defaults account for every
+            # header change, including parameter and result annotations.
+            old_header, new_header = copy(fn), copy(updated)
+            old_header.body = new_header.body = []
+            new_header.args = copy(updated.args)
+            new_header.args.defaults = fn.args.defaults
+            new_header.args.kw_defaults = fn.args.kw_defaults
+            if ast.dump(old_header) != ast.dump(new_header):
+                return False
     return (not analyzer.old_compiled(path)[1]
             and analyzer.old_layout(path, locals=False) == frame_layout(compiled, locals=False))
 
