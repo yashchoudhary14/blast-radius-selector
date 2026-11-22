@@ -194,9 +194,11 @@ class Execution:
                 probe_memory()
         proof = root = None
         tried_replay = set()
+        filtered_heavy = self.heavy_cases & discounts.keys()
+        promoted = set()
 
         def rank(n):
-            level = 0 if candidates.priority & (1 << n) else 1 if candidates.direct & (1 << n) else 2
+            level = -1 if n in promoted else 0 if candidates.priority & (1 << n) else 1 if candidates.direct & (1 << n) else 2
             return level, run_cost([n]), n
 
         def run(batch, early):
@@ -252,6 +254,13 @@ class Execution:
             best, margin = None, 0
             # A completed passing probe gives evidence for the clean path unless a failure was seen.
             pass_chance = 0.75 if (observed and not failed) else 0.5
+            # Filtered batches stop on failure. Put a worthwhile expensive
+            # case first so a cheap failure cannot prevent resolving it.
+            promoted = {
+                n for n in pending & filtered_heavy
+                if run_cost({n}) <= budget
+                and pass_chance * (static - roi_cost(conservative(selected - {n}))) > run_cost({n})
+            }
             seen = set()
             for batch in self.batches(pending, discounts):
                 key = frozenset(batch)
@@ -262,7 +271,7 @@ class Execution:
                 if estimate > budget:
                     continue
                 gain = static - roi_cost(conservative(selected - batch))
-                if len(key) == 2 and key <= self.heavy_cases and key <= discounts.keys():
+                if len(key) > 1 and (key & promoted or len(key) == 2 and key <= filtered_heavy):
                     first = min(batch, key=rank)
                     first_cost = run_cost({first})
                     first_gain = static - roi_cost(conservative(selected - {first}))
