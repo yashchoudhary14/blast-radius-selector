@@ -5,7 +5,6 @@ import gzip
 import json
 import marshal
 from bisect import bisect_left
-from functools import lru_cache
 from types import CodeType
 
 from runner.parser_cases import MAX_NODES
@@ -67,11 +66,6 @@ def frame_layout(code, *, locals=True):
     # closure or turn the entire function into a generator.
     return (code.co_name, code.co_flags, code.co_varnames if locals else (), code.co_freevars, code.co_cellvars,
             tuple(frame_layout(c, locals=locals) for c in code.co_consts if isinstance(c, CodeType)))
-
-
-@lru_cache(maxsize=32)
-def pinned_layout(base, path):
-    return frame_layout(compile((base / path).read_bytes(), path, "exec", dont_inherit=True))
 
 
 def body_spans(old, new, spans):

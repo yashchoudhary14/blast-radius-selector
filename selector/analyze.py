@@ -30,7 +30,7 @@ from .memory_edits import same_memory_workload
 from .operands import narrow
 from .parser_payload import unchanged_limit_assertions
 from .query_bindings import cached_stdlib_names
-from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
+from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
 from .source_equivalence import (_same_directives_text_only, added_binding, compile_source,
@@ -277,6 +277,7 @@ def numbers(mask):
         mask ^= low
 
 
+@lru_cache(maxsize=64)
 def collection_actions(source):
     """Find statements that can write shared state while a test module imports."""
     if source is None:
@@ -320,6 +321,7 @@ def removed_cells(before, after):
             and set(before.co_varnames) | old_cells == set(after.co_varnames) | new_cells)
 
 
+@lru_cache(maxsize=64)
 def interpreter_settings(source):
     """Find writes to interpreter-wide settings that survive a test's execution."""
     if not source or not any(name.encode() in source for name in INTERPRETER_SETTINGS):
@@ -527,6 +529,10 @@ class Analyzer:
     @lru_cache(maxsize=32)
     def old_code(self, path):
         return functions(self.old_compiled(path)[0])
+
+    @lru_cache(maxsize=32)
+    def old_layout(self, path, *, locals=True):
+        return frame_layout(self.old_compiled(path)[0], locals=locals)
 
     _SAFE_DYNAMIC_SITES = frozenset({
         ("sqlglot/expressions/core.py", 2491),
@@ -909,6 +915,7 @@ class Analyzer:
     def analyze(self, patch, *, prioritize=False, session=None, deadline=None, run_until=None, allow_probe=True):
         out = Candidates()
         edits = changes(self.base, patch)
+        revisions = {}
         out.paths = tuple(edits)
         isolated_tests = self.isolated_test_edits(edits)
         # Only verified test-method edits can accompany a single production edit.
@@ -1077,22 +1084,32 @@ class Analyzer:
                         continue
                 prior, subset_safe = out.mask, out.dialect_subset_safe
                 self.python(path, new, out, prioritize=prioritize, probe=probe, single_edit=production_count == 1,
-                            operand_safe=production_count == 1)
-                if concrete_edits and not out.broken and new is not None:
+                            operand_safe=production_count == 1, revisions=revisions)
+                if concrete_edits and not out.broken and path in revisions:
                     unaffected = 0
                     inert_for_memory = False
-                    if concrete(path, "dialects"):
+                    _, _, after, scopes = revisions[path]
+                    before, old_scopes = self.old(path)
+                    # The proofs can restore declarations and added methods.
+                    # Existing function definitions must already be identical.
+                    methods_added = before.keys() < after.keys()
+                    declarations_only = ((methods_added or scopes != old_scopes)
+                                         and before.keys() <= after.keys()
+                                         and all(row[2] == after[name][2] for name, row in before.items()))
+                    if declarations_only and concrete(path, "dialects"):
                         original = (self.base / path).read_bytes()
                         strict_changed = time_changes(path, original, new)
                         if strict_changed is not None:
                             unaffected = ~time_readers(self, strict_changed)
                             inert_for_memory = True
-                    elif self.dialect_reads.records and (concrete(path, "parsers") or concrete(path, "generators")):
+                    elif declarations_only and self.dialect_reads.records and (
+                        concrete(path, "parsers") or concrete(path, "generators")
+                    ):
                         original = (self.base / path).read_bytes()
                         tables = table_changes(path, original, new, self.dialect_reads.known_expression,
                                                self.dialect_reads.transform_callbacks(), self.dialect_reads.known_tokens())
                         keep = 0
-                        if not tables:
+                        if not tables and methods_added:
                             tables, keep = self.dialect_reads.generator_methods(path, original, new)
                         unaffected = self.dialect_reads.unrelated(tables) & ~keep
                         inert_for_memory = bool(tables) and concrete(path, "parsers")
@@ -1112,7 +1129,7 @@ class Analyzer:
                     out.priority &= ~omit
         if not out.broken and not out.structural:
             omit = unaffected_fixture_tests(self, edits)
-            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit):
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, revisions):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
@@ -1130,7 +1147,7 @@ class Analyzer:
                 number = self.num.get(test)
                 if (number in self.queries.maps and out.query_subsets.get(number) != []
                         and out.mask & ~out.query_blocked & (1 << number)
-                        and unchanged_comment_case(self, edits, out, number, stress=test == MAX_NODES)):
+                        and unchanged_comment_case(self, edits, out, number, revisions, stress=test == MAX_NODES)):
                     out.query_subsets[number] = []
         return out
 
@@ -1481,14 +1498,14 @@ class Analyzer:
             mask |= self.state_refs.mask(attr, tuple(sorted(keys)))
         return mask & self.binding_users(path)
 
-    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True):
+    def python(self, path, new, out, *, prioritize=False, probe=None, single_edit=False, operand_safe=True,
+               revisions=None):
         coverage = self.index["all_hits"].get(path, 0)
         try:
             if new is None:
                 raise SyntaxError("deleted module")
             # ast.parse alone accepts constructs such as return outside a function.
             compiled, diagnostics = compile_source(new, path)
-            tree = ast.parse(new, path)
             new_tree_for_stmts = ast.parse(new, path)
         except (ValueError, SyntaxError):
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
@@ -1499,8 +1516,8 @@ class Analyzer:
             out.broad |= coverage | self.importers[path] | self.file_tests[path]
             out.mark_broken("compile-warning", path)
             return
-        if single_edit and path == "tests/__init__.py" and len(tree.body) == 1:
-            doc = ast.get_docstring(tree, clean=False)
+        if single_edit and path == "tests/__init__.py" and len(new_tree_for_stmts.body) == 1:
+            doc = ast.get_docstring(new_tree_for_stmts, clean=False)
             if (doc is not None and ">>>" not in doc and not (self.base / path).read_bytes()
                     and _same_directives_text_only(b"", new)):
                 # The empty package now sets only __doc__. Keep readers of
@@ -1512,7 +1529,9 @@ class Analyzer:
                 out.query_spans[path] = None
                 return
         old_funcs, old_scopes = self.old(path)
-        new_funcs, new_scopes = snapshot(tree, new, old_funcs)
+        new_funcs, new_scopes = snapshot(new_tree_for_stmts, new, old_funcs)
+        if revisions is not None and path.startswith("sqlglot/"):
+            revisions[path] = (new_tree_for_stmts, compiled, new_funcs, new_scopes)
         dirty = {q for q in old_scopes.keys() | new_scopes.keys()
                  if scope_changed(old_scopes.get(q), new_scopes.get(q))}
         if dirty and path == "sqlglot/dialects/dialect.py":
@@ -1546,7 +1565,7 @@ class Analyzer:
                 if len(out.paths) == 1 and path == "sqlglot/generator.py" and self.dialect_reads.records:
                     original = (self.base / path).read_bytes()
                     tables = table_changes(path, original, new, self.dialect_reads.known_expression)
-                    if tables and pinned_layout(self.base, path) == frame_layout(compiled):
+                    if tables and self.old_layout(path) == frame_layout(compiled):
                         # Copies of the transform table still have the same
                         # keys. Only call sites selecting edited keys can
                         # run the new code, and heap checks keep attribution.
@@ -1686,7 +1705,7 @@ class Analyzer:
 
         @lru_cache(maxsize=1)
         def same_layout():
-            return pinned_layout(self.base, path) == frame_layout(compiled)
+            return self.old_layout(path) == frame_layout(compiled)
 
         safe_headers, query_defaults = {}, {}
         removed_keywords = {}

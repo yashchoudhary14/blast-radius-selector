@@ -6,7 +6,6 @@ import inspect
 from functools import lru_cache
 from types import CodeType
 
-from .scopes import snapshot
 from .source_equivalence import _has_dynamic_locals, _same_directives_text_only, same_code
 from .state_refs import functions
 
@@ -135,7 +134,7 @@ def equivalent_under_projection(before, projected, after):
     return same_code(projected, after.replace(co_varnames=projected.co_varnames))
 
 
-def unchanged_comment_case(analyzer, edits, candidates, number, *, stress):
+def unchanged_comment_case(analyzer, edits, candidates, number, revisions, *, stress):
     # The stress test only parses comment-free SELECTs with the default
     # dialect. The TPC-DS executor uses default parsing and DuckDB generation.
     from .analyze import _get_func_node
@@ -162,7 +161,7 @@ def unchanged_comment_case(analyzer, edits, candidates, number, *, stress):
             if candidates.isolated_test_paths[path] & bit:
                 return False
             continue
-        if path not in (PARSER, TOKENIZER) or not source:
+        if path not in (PARSER, TOKENIZER) or not source or path not in revisions:
             return False
         if analyzer.index["reads"].get(path, 0) & bit:
             return False
@@ -170,11 +169,10 @@ def unchanged_comment_case(analyzer, edits, candidates, number, *, stress):
         if not _same_directives_text_only(original, source):
             return False
         before, scopes = analyzer.old(path)
-        after, revised = snapshot(ast.parse(source), source)
+        new_tree, compiled, after, revised = revisions[path]
         if scopes != revised or before.keys() != after.keys():
             return False
         old_tree, _ = analyzer.old_tree_and_lines(path)
-        new_tree = ast.parse(source)
         reached = []
         for name, (_, header, body, _, end) in before.items():
             if header != after[name][1]:
@@ -191,7 +189,7 @@ def unchanged_comment_case(analyzer, edits, candidates, number, *, stress):
             continue
         old_normal = pinned_projection(original, path, stress)
         old_code = analyzer.old_code(path)
-        new_code = functions(compile(source, path, "exec", dont_inherit=True))
+        new_code = functions(compiled)
         for name in reached:
             normal_old, revised_code = old_normal.get(name), new_code.get(name)
             if (normal_old is None or revised_code is None

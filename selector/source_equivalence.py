@@ -54,20 +54,22 @@ def same_code(before, after):
     return same_sharing(before, after)
 
 
-def same_directives(before, after, insertion=None):
-    def directives(source):
-        return [(tok.start, tok.string) for tok in tokenize.tokenize(BytesIO(source).readline)
-                if tok.type == tokenize.ENCODING or (tok.type == tokenize.COMMENT and DIRECTIVE.match(tok.string))]
-
+@lru_cache(maxsize=64)
+def source_directives(source):
     try:
-        original = directives(before)
-        if insertion:
-            first, count = insertion
-            original = [((line + count if line >= first else line, col), value)
-                        for (line, col), value in original]
-        return original == directives(after)
+        return tuple((tok.start, tok.string, tok.line) for tok in tokenize.tokenize(BytesIO(source).readline)
+                     if tok.type == tokenize.ENCODING or (tok.type == tokenize.COMMENT and DIRECTIVE.match(tok.string)))
     except (SyntaxError, tokenize.TokenError, UnicodeError):
+        return None
+
+
+def same_directives(before, after, insertion=None):
+    original, updated = source_directives(before), source_directives(after)
+    if original is None or updated is None:
         return False
+    first, count = insertion or (0, 0)
+    return tuple(((line + count if line >= first else line, col), value)
+                 for (line, col), value, _ in original) == tuple((pos, value) for pos, value, _ in updated)
 
 
 @lru_cache(maxsize=128)
@@ -749,16 +751,9 @@ def text_message_only(old_source, source, old_tree, tree, changed_funcs):
 
 
 def _same_directives_text_only(before, after):
-    def directives(source):
-        return [(tok.start[0], tok.string) for tok in tokenize.tokenize(BytesIO(source).readline)
-                if tok.type == tokenize.ENCODING or (tok.type == tokenize.COMMENT and DIRECTIVE.match(tok.string))]
-
-    try:
-        b_dirs = [s for _, s in directives(before)]
-        a_dirs = [s for _, s in directives(after)]
-        return b_dirs == a_dirs
-    except (SyntaxError, tokenize.TokenError, UnicodeError):
-        return False
+    original, updated = source_directives(before), source_directives(after)
+    return (original is not None and updated is not None
+            and tuple(value for _, value, _ in original) == tuple(value for _, value, _ in updated))
 
 
 def line_insertion(before, after):

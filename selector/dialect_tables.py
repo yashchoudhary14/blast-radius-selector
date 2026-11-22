@@ -3,15 +3,13 @@
 import ast
 import gzip
 import json
-import tokenize
 from collections import defaultdict
 from functools import lru_cache
-from io import BytesIO
 from pathlib import Path, PurePosixPath
 
 from .config_edits import added_methods
 from .dialect_reads import SITES
-from .source_equivalence import DIRECTIVE
+from .source_equivalence import source_directives
 
 
 TABLES = {
@@ -21,14 +19,9 @@ TABLES = {
 
 
 def same_directive_lines(before, after):
-    def lines(source):
-        return [(tok.string, tok.line) for tok in tokenize.tokenize(BytesIO(source).readline)
-                if tok.type == tokenize.ENCODING or (tok.type == tokenize.COMMENT and DIRECTIVE.match(tok.string))]
-
-    try:
-        return lines(before) == lines(after)
-    except (SyntaxError, UnicodeError, tokenize.TokenError):
-        return False
+    original, updated = source_directives(before), source_directives(after)
+    return (original is not None and updated is not None
+            and tuple(row[1:] for row in original) == tuple(row[1:] for row in updated))
 
 
 def concrete(path, family):
