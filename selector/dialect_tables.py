@@ -136,7 +136,9 @@ def lookups(table, field, allow_fromkeys):
 
 def table_changes(path, original, updated, known_expression, transform_callbacks=(), known_tokens=()):
     """Accept only changes to inert entries in existing dialect dispatch tables."""
-    fields = next((fields for family, fields in TABLES.items() if concrete(path, family)), None)
+    shared = path == "sqlglot/generator.py"
+    fields = TABLES["generators"] if shared else next(
+        (fields for family, fields in TABLES.items() if concrete(path, family)), None)
     if fields is None or not same_directive_lines(original, updated):
         return {}
     old, new = ast.parse(original), ast.parse(updated)
@@ -226,6 +228,10 @@ def table_changes(path, original, updated, known_expression, transform_callbacks
         if not isinstance(a.value, ast.Dict) or not isinstance(b.value, ast.Dict):
             return {}
         field = key[1]
+        if shared and (key[0] != "Generator" or len(a.value.keys) != len(b.value.keys)
+                       or any((x is None) != (y is None) or x is not None and ast.dump(x) != ast.dump(y)
+                              for x, y in zip(a.value.keys, b.value.keys))):
+            return {}
         prior, spreads, order = lookups(a.value, field, allow_fromkeys)
         revised, new_spreads, new_order = lookups(b.value, field, allow_fromkeys)
         if prior is None or revised is None or [kind for kind, _ in spreads] != [kind for kind, _ in new_spreads]:
@@ -252,6 +258,13 @@ def table_changes(path, original, updated, known_expression, transform_callbacks
                 return {}
             if field == "RANGE_PARSERS" and name not in known_tokens:
                 return {}
+            if shared:
+                # Preserve the dispatch shape and eager evaluation. Only an
+                # existing lambda's deferred behavior may change at this key.
+                x, y = prior.get(name, ()), revised.get(name, ())
+                if (len(x) != 1 or len(y) != 1 or not isinstance(x[0][3], ast.Lambda)
+                        or not isinstance(y[0][3], ast.Lambda) or ast.dump(x[0][3].args) != ast.dump(y[0][3].args)):
+                    return {}
             for table, callbacks in values:
                 for _, _, _, value in table.get(name, ()):
                     if not inert(value, known_expression, callbacks, factories):

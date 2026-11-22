@@ -29,6 +29,7 @@ from .fixture_cases import unaffected_fixture_tests
 from .memory_edits import same_memory_workload
 from .operands import narrow
 from .parser_payload import unchanged_limit_assertions
+from .query_bindings import cached_stdlib_names
 from .query_cases import MAX_NODES, TPCDS, QueryCases, body_spans, frame_layout, pinned_layout
 from .registry_edits import added_expressions, changed_metadata
 from .scopes import scope_changed, snapshot
@@ -738,6 +739,55 @@ class Analyzer:
                         mask |= self.line_hits(path).get(line, 0) | self.indirect_hits.get(path, {}).get(line, 0)
         return mask
 
+    def cached_import_readers(self, path, names):
+        module = path[:-3].replace("/", ".")
+        exposed = {module}
+        if path.startswith("sqlglot/expressions/"):
+            # The pinned expression package reexports its submodules. Its
+            # class discovery only admits Expr subclasses. The functools
+            # callables cannot enter those registries or replace an export.
+            if any(name.lower() in self.expression_exports() for name in names):
+                return None
+            exposed.add("sqlglot.expressions")
+            functions_path = "sqlglot/expressions/functions.py"
+            tree, _ = self.old_tree_and_lines(functions_path)
+            if any(isinstance(node, ast.ImportFrom) and _resolve_import_from(functions_path, node) == module
+                   and any(alias.name == "*" for alias in node.names) for node in tree.body):
+                exposed.add("sqlglot.expressions.functions")
+        if exposed & self._test_star_imports():
+            return None
+        readers = self.location_observers(all_dynamic=True)
+        for name in names:
+            if name in self.state_refs.fields:
+                readers |= self.state_refs.mask(name)
+            for ref, lines in self.state_refs.refs.get(name, {}).items():
+                tree, _ = self.old_tree_and_lines(ref)
+                if any(node.lineno in lines and (
+                    isinstance(node, ast.Constant) and node.value == name
+                    or isinstance(node, ast.ImportFrom) and _resolve_import_from(ref, node) in exposed
+                    and any(alias.name == name for alias in node.names)
+                ) for node in ast.walk(tree) if isinstance(node, (ast.Constant, ast.ImportFrom))):
+                    readers |= self._lines_and_indirect_mask(ref, lines)
+        for ref, lines in self.state_refs.refs.get("*module", {}).items():
+            # These two lazy dispatchers resolve attributes in their own
+            # packages, so they cannot observe a binding elsewhere.
+            if (ref in {"sqlglot/dialects/__init__.py", "sqlglot/optimizer/__init__.py"}
+                    and path.rsplit("/", 1)[0] != ref.rsplit("/", 1)[0]):
+                continue
+            if ref == "sqlglot/serde.py" and self.dialect_reads.records:
+                field = "MODULE_ATTRIBUTE"
+                unobserved = self.dialect_reads.traced.get(field, 0)
+                for name in names:
+                    unobserved &= ~self.dialect_reads.observed.get((field, name), 0)
+                tree, _ = self.old_tree_and_lines(ref)
+                monitored = {node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call)
+                             and ast.unparse(node) == "getattr(module, class_name)"}
+                readers |= self._lines_and_indirect_mask(ref, set(lines) - monitored)
+                readers |= self._lines_and_indirect_mask(ref, monitored & set(lines)) & ~unobserved
+                continue
+            readers |= self._lines_and_indirect_mask(ref, lines)
+        return readers & self.binding_users(path)
+
     def _source_equivalence(self, path, new, new_tree, compiled, headers, scope_edits, *,
                             changed_bodies=(), funcs_same=True, probe=None, out=None, coverage=0):
         old = (self.base / path).read_bytes()
@@ -754,6 +804,14 @@ class Analyzer:
                   and same_directives(old, new, insertion)):
                 return self.location_observers(all_dynamic=True)
             if scope_edits or headers:
+                if (out is not None and len(out.paths) == 1
+                        and path not in {"sqlglot/__init__.py", "sqlglot/__main__.py"}
+                        and not path.endswith("/__init__.py") and b"from functools import " in new):
+                    names = cached_stdlib_names(old_tree, new_tree, insertion)
+                    if names and same_directives(old, new, insertion):
+                        readers = self.cached_import_readers(path, names)
+                        if readers is not None:
+                            return readers
                 binding = added_binding(old_tree, new_tree, insertion, path, before)
                 if binding is not None and same_directives(old, new, insertion):
                     name, module = binding
@@ -1485,6 +1543,14 @@ class Analyzer:
                 dict_mask = self._dict_key_candidates(path, new)
             if dict_mask is not None:
                 readers = dict_mask | (self.location_observers() & self.importers[path])
+                if len(out.paths) == 1 and path == "sqlglot/generator.py" and self.dialect_reads.records:
+                    original = (self.base / path).read_bytes()
+                    tables = table_changes(path, original, new, self.dialect_reads.known_expression)
+                    if tables and pinned_layout(self.base, path) == frame_layout(compiled):
+                        # Copies of the transform table still have the same
+                        # keys. Only call sites selecting edited keys can
+                        # run the new code, and heap checks keep attribution.
+                        readers &= ~(self.dialect_reads.unrelated(tables) & ~self.index["heap_observers"])
                 out.broad |= readers
                 out.guard_query_readers(path, readers)
                 return
