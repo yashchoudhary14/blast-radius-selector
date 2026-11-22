@@ -1078,7 +1078,7 @@ class Analyzer:
             out.query_spans[path] = None
         if not out.broken and not out.structural:
             omit = unaffected_fixture_tests(self, edits, other_mask=other_mask)
-            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit):
+            if out.mask & memory_bit and same_memory_workload(self, edits, memory_bit, candidates=out):
                 omit |= memory_bit
             out.direct &= ~omit
             out.broad &= ~omit
@@ -1687,6 +1687,7 @@ class Analyzer:
 
         safe_headers, query_defaults = {}, {}
         removed_keywords = {}
+        query_frame_changed = False
         if shared_core(path) and not scope_edit:
             changed_headers = [q for q in old_funcs.keys() & new_funcs.keys()
                                if old_funcs[q][1] != new_funcs[q][1]]
@@ -1782,6 +1783,8 @@ class Analyzer:
                         code = functions(compiled)
                     old_frame, new_frame = self.old_code(path).get(q), code.get(q)
                     frame_changed = changes_frame_bindings(old_frame, new_frame)
+                    if frame_changed:
+                        query_frame_changed = True
                     if (frame_changed and shared_core(path) and removed_cells(old_frame, new_frame)):
                         frame_changed = False
                         relocated_cells = True
@@ -1846,7 +1849,7 @@ class Analyzer:
                 if method in {"setUp", "tearDown", "setUpClass", "tearDownClass",
                               "setUpModule", "tearDownModule"}:
                     dirty.add(owner)
-        if out.query_spans.get(path) and not same_layout():
+        if out.query_spans.get(path) and query_frame_changed:
             out.query_spans[path] = None
         literal_default_only = (query_defaults and old_scopes == new_scopes
                                 and old_funcs.keys() == new_funcs.keys()
